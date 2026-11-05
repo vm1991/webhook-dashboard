@@ -3,13 +3,15 @@
 Living document. Built in small phases; each phase works end to end before the next starts.
 Later phases are outlined only and are expanded when we reach them.
 
-| Phase | Scope | Status |
-|---|---|---|
-| 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | ☐ |
-| 1 | Create event, duplicate handling, deliver once, view history | ☐ |
-| 2 | Bounded retries + "process pending" | ☐ |
-| 3 | HTTP destinations, timeouts, backoff, restart safety | ☐ |
-| 4 | Browser UI, seed + reset, README | ☐ |
+> **Review status:** only sections marked **Reviewed** are approved. Sections marked **Draft — needs review** are a first draft and may change before they are built.
+
+| Phase | Scope | Spec | Build |
+|---|---|---|---|
+| 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | Local ✓, deploy pending |
+| 1 | Create event, duplicate handling, deliver once, view history | Draft — needs review | ☐ |
+| 2 | Bounded retries + "process pending" | Draft — needs review | ☐ |
+| 3 | HTTP destinations, timeouts, backoff, restart safety | Draft — needs review | ☐ |
+| 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
 
 ## Stack
 - Python 3.13, FastAPI, SQLAlchemy 2.x, PostgreSQL, pytest
@@ -19,7 +21,7 @@ Later phases are outlined only and are expanded when we reach them.
 
 ---
 
-## Phase 0 — Wiring
+## Phase 0 — Wiring  ·  *Reviewed*
 
 **Goal:** prove the stack works locally and live before writing features.
 
@@ -36,7 +38,7 @@ Later phases are outlined only and are expanded when we reach them.
 
 ---
 
-## Phase 1 — Events, duplicates, single delivery
+## Phase 1 — Events, duplicates, single delivery  ·  *Draft — needs review*
 
 ### Destinations (simulated, in-process for this phase)
 | Key | Behavior |
@@ -104,18 +106,18 @@ Later phases are outlined only and are expanded when we reach them.
 
 ---
 
-## Phase 2 — Bounded retries (outline)
+## Phase 2 — Bounded retries (outline)  ·  *Draft — needs review*
 - Max attempts (default 5); after the last failure, status `FAILED` (terminal).
 - `POST /deliveries/process` → one attempt for every eligible `PENDING` event.
 - Tests: retry limit stops at max; fail → fail → success via process.
 
-## Phase 3 — Resilience (outline)
+## Phase 3 — Resilience (outline)  ·  *Draft — needs review*
 - Destinations become real HTTP endpoints (`POST /sim/{behavior}`), called with `httpx` and a timeout; event id sent as `Idempotency-Key` header; `fail_twice` keeps its own counter table.
 - Backoff: `next_attempt_at` after each failure; process skips events not yet due.
 - Restart safety: `IN_PROGRESS` + lease, rows claimed with `FOR UPDATE SKIP LOCKED`. Guarantee: at-least-once.
 - Optional `slow` destination to demonstrate timeouts.
 
-## Phase 4 — Ship (outline)
+## Phase 4 — Ship (outline)  ·  *Draft — needs review*
 - Single static HTML page: create form, events table, attempt history, "Process pending" and "Reset demo" buttons.
 - Seed one event per destination on empty DB; `POST /admin/reset` wipes and reseeds.
 - README: run locally, architecture, retry policy and guarantees, limitations, AI usage.

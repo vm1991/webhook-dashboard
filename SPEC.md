@@ -7,11 +7,24 @@ Later phases are outlined only and are expanded when we reach them.
 
 | Phase | Scope | Spec | Build |
 |---|---|---|---|
-| 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | Local ✓, deploy pending |
-| 1 | Create event, duplicate handling, deliver once, view history | Draft — needs review | ☐ |
+| 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | ✓ Done (live) |
+| 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ☐ |
 | 2 | Bounded retries + "process pending" | Draft — needs review | ☐ |
 | 3 | HTTP destinations, timeouts, backoff, restart safety | Draft — needs review | ☐ |
 | 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
+
+## Requirements coverage
+| # | Requirement (from the brief) | Covered in |
+|---|---|---|
+| 1 | Create event with unique ID + JSON payload | Phase 1 |
+| 2 | Select one of three simulated destinations | Phase 1 (in-process), Phase 3 (HTTP) |
+| 3 | Attempt delivery; view status and history (timestamps, outcomes, errors) | Phase 1 |
+| 4 | Bounded retries; button to process pending deliveries | Phase 2 |
+| 5 | Duplicate submissions; defined behavior for same ID + different payload | Phase 1 |
+| 6 | Retained across refresh and restart | Phase 0 (Postgres), Phase 3 (restart mid-delivery) |
+| — | Delivery timeouts | Phase 3 |
+| — | Browser UI, seed data, reset | Phase 4 |
+| — | Tests: duplicates, retry limit, failed → successful | Phase 1 (T2, T4, T9), Phase 2 (retry limit) |
 
 ## Stack
 - Python 3.13, FastAPI, SQLAlchemy 2.x, PostgreSQL, pytest
@@ -32,77 +45,95 @@ Later phases are outlined only and are expanded when we reach them.
 **Repo contents:** `app/`, `tests/`, `requirements.txt`, `.env.example`, `.gitignore`, `README.md`.
 
 **Acceptance criteria**
-- [ ] `pytest` passes locally (test calls `/health`, expects 200).
-- [ ] `https://<app>.onrender.com/health` returns a timestamp read from Neon.
-- [ ] Push to `main` redeploys automatically.
+- [x] `pytest` passes locally (test calls `/health`, expects 200).
+- [x] `https://webhook-dashboard-2x9d.onrender.com/health` returns a timestamp read from Neon.
+- [x] Push to `main` redeploys automatically.
 
 ---
 
-## Phase 1 — Events, duplicates, single delivery  ·  *Draft — needs review*
+## Phase 1 — Events, duplicates, single delivery  ·  *Reviewed*
 
 ### Destinations (simulated, in-process for this phase)
 | Key | Behavior |
 |---|---|
 | `always_succeed` | Succeeds every time |
 | `fail_twice` | Fails the 1st and 2nd attempt **for that event**, succeeds from the 3rd |
-| `always_fail` | Fails every time |
+| `always_fail` | Fails every time (a retryable failure; only the retry limit in Phase 2 stops it) |
 
+- The destination is chosen **when the event is created** and stored on the event, so later deliveries and retries know where to send.
 - Implemented as Python functions behind one interface: `deliver(event) -> (ok: bool, error: str | None)`.
-- `fail_twice` decides from the number of previous attempts for that event stored in the DB (not in memory), so it survives restarts.
+- `fail_twice` decides from the number of previous attempts for that event in the DB (not memory), so it survives restarts.
 
 ### Data model
 **events**
-| Column | Type | Notes |
+| Column | Type | Rule |
 |---|---|---|
-| id | serial PK | |
-| event_id | text, **unique** | client-supplied |
-| payload | jsonb | |
-| payload_hash | text | SHA-256 of canonical JSON |
-| destination | text | one of the three keys |
-| status | text | `PENDING` or `SUCCEEDED` (more in Phase 2) |
-| attempt_count | int | default 0 |
-| created_at, updated_at | timestamptz | |
+| id | integer | primary key |
+| event_id | text | **unique**, not null (client-supplied) |
+| payload | jsonb | not null |
+| destination | text | not null; one of the three keys |
+| status | text | not null, default `PENDING`; `PENDING` → `SUCCEEDED` (`FAILED` added in Phase 2) |
+| attempt_count | integer | not null, default 0 |
+| created_at, updated_at | timestamptz | not null, UTC |
 
 **delivery_attempts**
-| Column | Type | Notes |
+| Column | Type | Rule |
 |---|---|---|
-| id | serial PK | |
-| event_id | FK → events | |
-| attempt_no | int | 1, 2, 3… |
-| started_at, finished_at | timestamptz | |
-| outcome | text | `SUCCESS` or `FAILURE` |
-| error | text, nullable | failure reason |
+| id | integer | primary key |
+| event_pk | integer | not null, references `events.id` |
+| attempt_no | integer | not null |
+| attempted_at | timestamptz | not null, UTC |
+| outcome | text | not null; `SUCCESS` or `FAILURE` |
+| error | text | nullable; empty on success |
+| | | **unique (`event_pk`, `attempt_no`)** |
 
 ### API
 **`POST /events`** — body `{ "event_id": str, "payload": object, "destination": str }`
-| Case | Response |
-|---|---|
-| New `event_id` | **201** + event |
-| Same `event_id`, same payload and destination | **200** + existing event; nothing created |
-| Same `event_id`, different payload or destination | **409** `{ "error": "event_id already exists with a different payload" }`; original unchanged |
-| Invalid input (bad JSON, unknown destination, empty id) | **422** |
+| Case | Code | Body |
+|---|---|---|
+| New `event_id` | **201** | Event (`status: PENDING`, `attempt_count: 0`) |
+| Same `event_id`, same payload and destination (any status) | **200** | Existing event with current status, `"duplicate": true`, `"message": "Event already submitted"`. Nothing changes. |
+| Same `event_id`, different payload or destination (any status) | **422** | `"error": "event_id_reused_with_different_payload"` + message to use a new event_id. Original unchanged. Follows the IETF Idempotency-Key draft. |
+| Different `event_id`, same payload | **201** | A separate event (the ID identifies an event, not its content) |
+| Invalid input (missing field, bad JSON, payload not an object, unknown destination, empty id) | **422** | FastAPI's standard validation error (`"detail": [...]`) |
 
-- "Same payload" = same **canonical JSON** (sorted keys, no whitespace): `{"a":1,"b":2}` equals `{"b":2,"a":1}`.
-- Must be safe under concurrent duplicate submits: rely on the DB unique constraint (`INSERT … ON CONFLICT DO NOTHING`, then compare hashes), never "check then insert".
+- Payloads are compared in the app as **canonical JSON** (`json.dumps(sort_keys=True, separators=(",", ":"))`), so key order and whitespace don't matter. Not `dict == dict`, because Python treats `True == 1`. `1` and `1.0` count as different payloads.
+- Safe under concurrent duplicate submits: rely on the DB unique constraint (`INSERT … ON CONFLICT DO NOTHING`, then compare), never "check then insert". A simultaneous duplicate waits on the unique index, then sees the committed row.
 
 **`POST /events/{event_id}/deliver`** — makes exactly one attempt now.
-- Records an attempt row, increments `attempt_count`.
-- Success → status `SUCCEEDED`. Failure → status stays `PENDING` (can be delivered again).
-- Already `SUCCEEDED` → **409**, no attempt made.
-- Unknown event → **404**.
+- Inserts the attempt row and updates the event (`attempt_count`, `updated_at`, `status`) **in one transaction**.
 
-**`GET /events`** — list: event_id, destination, status, attempt_count, created_at (newest first).
+| Case | Code | Body |
+|---|---|---|
+| Attempt succeeded | **200** | Updated event (`SUCCEEDED`) + this attempt (`outcome: SUCCESS`) |
+| Attempt failed | **200** | Updated event (`PENDING`) + this attempt (`outcome: FAILURE`, `error` set). The failure is data, not a server error. |
+| Event already `SUCCEEDED` | **409** | `"error": "already_succeeded"`; no attempt made |
+| Simultaneous deliver on the same event (the loser) | **409** | `"error": "delivery_conflict"` (unique `event_pk, attempt_no` blocks it) |
+| Unknown event | **404** | `"error": "not_found"` |
 
-**`GET /events/{event_id}`** — event incl. payload + attempts ordered by attempt_no.
+**`GET /events`** — **200**: list (event_id, destination, status, attempt_count, created_at), newest first.
+
+**`GET /events/{event_id}`** — **200**: event, payload and attempts ordered by attempt_no. Unknown → **404**.
 
 ### Acceptance criteria (automated tests)
-- [ ] Same id + same payload twice → 1 row; second call returns 200.
-- [ ] Same id, keys in a different order → treated as the same (200).
-- [ ] Same id, different payload → 409; stored payload unchanged.
-- [ ] `always_succeed` → one deliver → `SUCCEEDED`, 1 attempt.
-- [ ] `fail_twice` → deliver ×3 → attempts FAILURE, FAILURE, SUCCESS; status `SUCCEEDED`.
-- [ ] `always_fail` → deliver → `PENDING`, attempt has an error message.
-- [ ] Deliver on a `SUCCEEDED` event → 409, no new attempt.
+| # | Test | Expected |
+|---|---|---|
+| T1 | Create a new event | 201, `PENDING`, 0 attempts |
+| T2 | Same id + same payload twice | 2nd call 200, `duplicate: true`; 1 row in DB |
+| T3 | Same id, keys in a different order | 200 (treated as identical) |
+| T4 | Same id, different payload | 422 `event_id_reused_with_different_payload`; stored payload unchanged |
+| T5 | Same id + payload, different destination | 422 |
+| T6 | Different ids, same payload | 201, 201; two rows |
+| T7 | Unknown destination | 422 (validation) |
+| T8 | `always_succeed` → deliver | 200, `SUCCEEDED`, 1 attempt `SUCCESS` |
+| T9 | `fail_twice` → deliver ×3 | FAILURE, FAILURE, SUCCESS; `SUCCEEDED`, attempt_count 3 |
+| T10 | `always_fail` → deliver | 200, outcome FAILURE, error recorded, status `PENDING` |
+| T11 | Deliver a `SUCCEEDED` event | 409; still 1 attempt |
+| T12 | Deliver an unknown event | 404 |
+| T13 | Duplicate submit after success | 200, `duplicate: true`, `status: SUCCEEDED` |
+| T14 | `GET /events/{id}` after `fail_twice` ×3 | 3 attempts in order with attempted_at, outcome, error |
+
+The simultaneous-deliver race is enforced by the DB unique rule and tested in Phase 3 with the delivery lock.
 
 ---
 
@@ -128,14 +159,19 @@ Later phases are outlined only and are expanded when we reach them.
 | # | Decision | Why |
 |---|---|---|
 | D1 | FastAPI over .NET / Spring Boot | Fastest to build, free hosting is simple, built-in Swagger UI at `/docs` |
-| D2 | Same id + different payload → 409, original kept | Overwriting would break idempotency; client must use a new id |
-| D3 | Different destination with same id + payload → 409 | The request is not identical |
-| D4 | Payload compared as canonical JSON hash | Key order / whitespace shouldn't create false conflicts |
+| D2 | Same id + different payload → 422, original kept (see D10) | Overwriting would break idempotency; client must use a new id |
+| D3 | Different destination with same id + payload → 422 | The request is not identical |
+| D4 | Payload compared as canonical JSON in the app; no hash column | Duplicates are found by event_id and payloads are small. At scale: store a SHA-256 of the canonical form |
 | D5 | Creating an event does not deliver it | Keeps each step visible and testable |
 | D6 | One destination per event | Matches the requirement; separate attempts table keeps multi-destination a small change |
 | D7 | Phase 1 destinations are in-process functions | Avoids the app calling itself over HTTP before the basics work; replaced in Phase 3 |
 | D8 | No authentication | Demo app; reviewers must not need credentials |
 | D9 | Neon for local dev too (no Docker) | Docker not installed on the dev machine; one fewer moving part. Tests use a separate `webhooks_test` database |
+| D10 | Same id + different payload → **422** in every status, with error code `event_id_reused_with_different_payload` | Follows the IETF Idempotency-Key draft (draft-ietf-httpapi-idempotency-key-header). Distinct error code separates it from FastAPI validation 422s. A duplicate submit never modifies data; edits would need an explicit PUT allowed only before the first attempt |
+| D11 | Exact duplicate → **200** with current state in every status (incl. `PENDING`) | A retry must get a success response. IETF's 409 "still processing" applies only while the original request is in flight; create is a single atomic insert, so it can't occur here. PENDING is business state, not an in-flight request |
+| D12 | A failed delivery attempt returns 200 | The API call worked; the destination's failure is data in the body |
+| D13 | Destination chosen at create time | Retries need to know where to send. One event → many destinations would need a `deliveries` table (likely follow-up change) |
+| D14 | All failures are retryable until the limit; no transient/permanent split | Keeps scope minimal; `always_fail` must be retried to demonstrate the limit. Production would treat 4xx (except 408/429) as permanent |
 
 ## AI usage log
 Record each AI suggestion that was corrected or rejected (feeds the README section).

@@ -174,26 +174,32 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 | D14 | All failures are retryable until the limit; no transient/permanent split | Keeps scope minimal; `always_fail` must be retried to demonstrate the limit. Production would treat 4xx (except 408/429) as permanent |
 
 ## AI usage log
-Record each AI suggestion that was corrected or rejected (feeds the README section).
+Record of where I questioned, corrected or rejected AI output (feeds the README section).
 
-**Tools:** Claude (chat, in the desktop app) for planning, spec review and code review; Claude Code (VS Code extension) for implementation. Every Claude Code change started from a file plan I approved, and I reviewed every diff and ran the tests before committing.
+**Tools:** Claude (chat, desktop app) for planning, spec discussion and reviewing Claude Code's plans; Claude Code (VS Code extension) for implementation.
 
-**How I checked output:** compared each plan against `SPEC.md` before approving; read every diff; ran `pytest` locally and smoke-tested the live URL after each push; verified API design choices against primary sources (IETF Idempotency-Key draft, Stripe docs) rather than taking the AI's word.
+**How I checked output:** every Claude Code change started from a file plan I approved against `SPEC.md`; I read every diff, ran `pytest` locally and smoke-tested the live URL after each push; I verified API design choices against primary sources (IETF Idempotency-Key draft, Stripe docs) instead of taking the AI's answer; I confirmed files actually changed on disk rather than trusting "done".
 
-| Date | Tool | Suggestion | What I did | Why |
+### Decisions I drove
+| Date | AI suggested | What I did | Why | How I verified |
 |---|---|---|---|---|
-| Nov 5 | Claude | First spec draft covered everything at once (multiple tables, leases, backoff, optional destinations) | Rejected; rescoped into small phases (0–4), each working end to end | Too much to review and build at once; phases keep each diff small and reviewable |
-| Nov 5 | Claude | Local Postgres in Docker | Dropped; used Neon for local dev and live, separate test database | Docker not installed; one fewer moving part (D9) |
-| Nov 5 | Claude Code | Phase 0 plan used Neon's `postgresql://` URL as-is | Required converting it to `postgresql+psycopg://` | SQLAlchemy reads the plain scheme as psycopg2, which isn't installed; the app would crash on startup |
-| Nov 5 | Claude Code | `/health` 503 test planned with tables created at startup | Required simulating the DB failure *after* startup (monkeypatch), not an unreachable host | With startup DB init, the app never starts when the DB is down, so the 503 path could never be tested; a fake host can also hang the test |
-| Nov 5 | Claude Code | Engine without connection health checks; unpinned dependencies; deprecated `on_event` startup | Added `pool_pre_ping=True`, pinned versions, used the lifespan handler | Neon suspends idle connections; reproducible Render builds; current FastAPI API |
-| Nov 5 | Claude Code | Test setup failed with `ModuleNotFoundError: app` | Added `pytest.ini` with `pythonpath = .` | Plain `pytest` doesn't put the repo root on the import path |
-| Nov 6 | Claude | Store a `payload_hash` column to detect duplicates | Dropped it; compare canonical JSON in the app (D4) | Duplicates are found by `event_id` and payloads are small, so a hash adds a column for no benefit. Also rejected plain `dict == dict` because Python treats `True == 1` |
-| Nov 6 | Claude | Name the attempts foreign key `event_id` while pointing at `events.id` | Renamed to `event_pk` | Two different things named `event_id` would be confusing in code and in the walkthrough |
-| Nov 6 | Me → Claude | I proposed choosing the destination at delivery time | Kept it at create time after discussing it (D13) | The "process pending" retry needs to know where to send; per-attempt destinations would need per-destination status. Kept as the answer to a "multiple destinations" follow-up |
-| Nov 6 | Claude | Same ID + different payload → 409 | Changed to **422** with a distinct error code (D10) | Checked the IETF Idempotency-Key draft, which specifies 422 for key reuse with a different payload |
-| Nov 6 | Me → Claude | I proposed 409 for an exact duplicate while the event is still `PENDING` | Kept **200** with current status after checking the IETF draft and Stripe docs (D11) | Their 409 is for a retry while the original *request* is still in flight; `PENDING` is business state, and a retry must get a success response |
-| Nov 6 | Me → Claude | I proposed letting a pending event's payload be overwritten | Rejected (D10) | Attempts may already have sent the old payload; overwrites make retries unsafe (last write wins) |
-| Nov 6 | Claude | Transient vs permanent failure classes | Out of scope (D14) | `always_fail` must be retried to demonstrate the limit; noted as a production change |
-| Nov 6 | Claude Code | Offered a global handler mapping all `SQLAlchemyError` to 503 | Narrowed to `OperationalError` only; confirmed `IntegrityError` on deliver returns 409 `delivery_conflict` | 503 means "try later"; constraint violations are conflicts or bugs and shouldn't be masked as unavailability |
-| Nov 6 | — | Router with `prefix="/events"` | Used `""` (not `"/"`) for collection routes | `"/"` makes the path `/events/` and causes a 307 redirect from `/events`, which can drop POST bodies |
+| Nov 5 | A full spec covering every requirement at once | rescoped into small phases (0–4), each working end to end | Smaller diffs I can actually review and explain | Phase 0 shipped live before any feature work |
+| Nov 5 | A stack-only first phase was not planned | Added Phase 0: framework + DB + test + live deploy before features | Remove deployment risk first | `/health` read from Neon on the live URL |
+| Nov 6 | A `payload_hash` column for duplicate detection | Questioned whether a hash was needed; dropped it and compare canonical JSON in the app (D4) | Duplicates are looked up by `event_id`, payloads are small; a hash added a column for no benefit | Tests T2–T4 (identical, reordered keys, different payload) |
+| Nov 6 | A `finished_at` column on attempts | Dropped for Phase 1 | Delivery is an in-process call; one timestamp covers "timestamps". Added back only when restart detection needs it | Spec review |
+| Nov 6 | Same ID + different payload → 409 | Changed to **422** with a distinct error code (D10) | Matches the IETF Idempotency-Key draft | Read the IETF draft and Stripe docs |
+| Nov 6 | Exact duplicate → 200 | I challenged it for `PENDING` events (proposed 409); asked for it to be checked against standards; kept 200 (D11) | The standard's 409 is for a retry while the original *request* is still in flight; `PENDING` is business state | IETF draft + Stripe docs |
+| Nov 6 | Destination stored on the event | I questioned why it's stored when the endpoints are simulated; kept it after walking through retries (D13) | "Process pending" must know where to send; one event → many destinations would need a separate table (kept as a follow-up answer) | Spec review |
+| Nov 6 | (my idea) Overwrite payload while event is `PENDING` | Rejected after analysis (D10) | Attempts may already have sent the old payload; last-write-wins makes retries unsafe | Spec review |
+| Nov 6 | (my idea) Transient vs permanent failure classes | Deferred to "production changes" (D14) | `always_fail` must be retried to demonstrate the retry limit | Spec review |
+| Nov 6 | Claude Code offered to map all DB errors to 503 | Approved only a narrower handler: connection errors (`OperationalError`) → 503; confirmed constraint violations on deliver → 409 | 503 means "try later"; conflicts and bugs must not be masked as unavailability | Added a 503 test |
+| Nov 6 | Routes defined with full paths | Moved event routes under `APIRouter(prefix="/events")`, using `""` not `"/"` for collection routes | Cleaner routing; `"/"` would cause a 307 redirect from `/events` | `pytest` passes unchanged |
+| Nov 6 | AI reported spec updates as done | Noticed several times the file on disk had not changed; flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
+
+### Issues caught when Claude reviewed Claude Code's plans (I approved and applied each fix)
+| Date | Claude Code's plan | Fix applied | Why | How I verified |
+|---|---|---|---|---|
+| Nov 5 | Used Neon's `postgresql://` URL as-is | Convert to `postgresql+psycopg://` | Plain scheme loads psycopg2 (not installed) → crash on startup | App starts locally and on Render |
+| Nov 5 | 503 test with tables created at startup | Simulate DB failure *after* startup (monkeypatch) | Otherwise the app can't start when the DB is down, so 503 is untestable | 503 test passes |
+| Nov 5 | No connection health check; unpinned deps; deprecated `on_event` | `pool_pre_ping=True`, pinned versions, lifespan handler | Neon suspends idle connections; reproducible builds | Live `/health` after idle period |
+| Nov 5 | `pytest` failed: `ModuleNotFoundError: app` | Added `pytest.ini` (`pythonpath = .`) | Repo root wasn't on the import path | `pytest` passes |

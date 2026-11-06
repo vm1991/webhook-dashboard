@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class EventCreate(BaseModel):
     event_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_-]+$")
     payload: dict[str, Any]
-    destination: Literal["always_succeed", "fail_twice", "always_fail"]
+    destination: Literal["always_succeed", "fail_twice", "always_fail", "slow"]
 
 
 class EventOut(BaseModel):

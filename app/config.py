@@ -17,6 +17,32 @@ def get_max_attempts() -> int:
     return value
 
 
+def _get_float(name: str, default: str, minimum: float) -> float:
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be a number >= {minimum:g}, got {raw!r}") from None
+    if value < minimum:
+        raise RuntimeError(f"{name} must be a number >= {minimum:g}, got {raw!r}")
+    return value
+
+
+def get_delivery_timeout() -> float:
+    return _get_float("DELIVERY_TIMEOUT_SECONDS", "2", 0.001)
+
+
+def get_sim_slow_seconds() -> float:
+    return _get_float("SIM_SLOW_SECONDS", "5", 0)
+
+
+def get_sim_base_url() -> str:
+    url = os.environ.get("SIM_BASE_URL")
+    if url:
+        return url.rstrip("/")
+    return f"http://127.0.0.1:{os.environ.get('PORT', '8000')}"
+
+
 def get_database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:

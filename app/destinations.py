@@ -1,28 +1,27 @@
-"""Simulated in-process destinations (Phase 1)."""
+"""Delivery call: POST to the simulated receiver (/sim/{destination}) with httpx."""
+import httpx
+
+from app.config import get_delivery_timeout, get_sim_base_url
 
 
-def always_succeed(event) -> tuple[bool, str | None]:
-    return True, None
+def _send(url: str, payload: dict, headers: dict, timeout: float) -> httpx.Response:
+    # Single seam for the HTTP call; tests replace it to go through TestClient.
+    return httpx.post(url, json=payload, headers=headers, timeout=timeout)
 
 
-def always_fail(event) -> tuple[bool, str | None]:
-    return False, "always_fail: destination rejected the delivery"
-
-
-def fail_twice(event) -> tuple[bool, str | None]:
-    # attempt_count is the DB value loaded for this request (previous attempts),
-    # so the behavior survives restarts.
-    if event.attempt_count < 2:
-        return False, f"fail_twice: simulated failure on attempt {event.attempt_count + 1}"
-    return True, None
-
-
-_DESTINATIONS = {
-    "always_succeed": always_succeed,
-    "fail_twice": fail_twice,
-    "always_fail": always_fail,
-}
-
-
-def deliver(event) -> tuple[bool, str | None]:
-    return _DESTINATIONS[event.destination](event)
+def deliver(event, attempt_no: int) -> tuple[bool, str | None]:
+    timeout = get_delivery_timeout()
+    url = f"{get_sim_base_url()}/sim/{event.destination}"
+    headers = {
+        "Idempotency-Key": event.event_id,
+        "X-Attempt-No": str(attempt_no),
+    }
+    try:
+        response = _send(url, event.payload, headers, timeout)
+    except httpx.TimeoutException:  # before RequestError: it is a subclass
+        return False, f"timeout after {timeout:g}s"
+    except httpx.RequestError as exc:
+        return False, f"request error: {type(exc).__name__}"
+    if response.is_success:
+        return True, None
+    return False, f"HTTP {response.status_code}"

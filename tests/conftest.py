@@ -12,13 +12,20 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from sqlalchemy import text  # noqa: E402
 
-from app import db  # noqa: E402
+from app import db, destinations  # noqa: E402
 from app.main import app  # noqa: E402
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("SIM_BASE_URL", "http://testserver")
     with TestClient(app) as c:
+        # Route the sender's HTTP call through the in-process app.
+        monkeypatch.setattr(
+            destinations,
+            "_send",
+            lambda url, payload, headers, timeout: c.post(url, json=payload, headers=headers),
+        )
         # Tables exist after startup; start every test from an empty DB.
         with db.engine.begin() as conn:
             conn.execute(

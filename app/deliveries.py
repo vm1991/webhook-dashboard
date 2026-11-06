@@ -32,7 +32,7 @@ def attempt_delivery(session: Session, event: Event) -> DeliveryAttempt | None:
     Returns None if a concurrent delivery won (unique event_pk/attempt_no).
     """
     attempt_no = event.attempt_count + 1
-    ok, err = destinations.deliver(event)
+    ok, err = destinations.deliver(event, attempt_no)
     now = utcnow()
 
     attempt = DeliveryAttempt(

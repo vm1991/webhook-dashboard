@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from app import db
+from app import db, events
 
 
 @asynccontextmanager
@@ -15,6 +15,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Webhook Delivery Dashboard", lifespan=lifespan)
+app.include_router(events.router)
+
+
+@app.exception_handler(OperationalError)
+async def database_unavailable(request: Request, exc: OperationalError):
+    # Only connectivity-type errors; other DB errors (e.g. IntegrityError) stay 500.
+    # No exception details in the body.
+    return JSONResponse(status_code=503, content={"error": "database_unavailable"})
 
 
 @app.get("/")

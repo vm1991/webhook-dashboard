@@ -10,10 +10,18 @@ os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from sqlalchemy import text  # noqa: E402
+
+from app import db  # noqa: E402
 from app.main import app  # noqa: E402
 
 
 @pytest.fixture()
 def client():
     with TestClient(app) as c:
+        # Tables exist after startup; start every test from an empty DB.
+        with db.engine.begin() as conn:
+            conn.execute(
+                text("TRUNCATE delivery_attempts, events RESTART IDENTITY")
+            )
         yield c

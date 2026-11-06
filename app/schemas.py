@@ -16,7 +16,7 @@ class EventOut(BaseModel):
     event_id: str
     payload: dict[str, Any]
     destination: str
-    status: str
+    status: Literal["PENDING", "SUCCEEDED", "FAILED"]
     attempt_count: int
     created_at: datetime
     updated_at: datetime
@@ -32,7 +32,7 @@ class EventListItem(BaseModel):
 
     event_id: str
     destination: str
-    status: str
+    status: Literal["PENDING", "SUCCEEDED", "FAILED"]
     attempt_count: int
     created_at: datetime
 
@@ -42,7 +42,7 @@ class AttemptOut(BaseModel):
 
     attempt_no: int
     attempted_at: datetime
-    outcome: str
+    outcome:  Literal["SUCCESS", "FAILURE"]
     error: str | None
 
 

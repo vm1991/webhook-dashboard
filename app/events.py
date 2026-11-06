@@ -39,6 +39,7 @@ def respond(status: int, model) -> JSONResponse:
 def create_event(body: EventCreate):
     with db.SessionLocal() as session:
         # The DB unique constraint decides who wins; never "check then insert".
+        now = utcnow()
         inserted_id = session.execute(
             insert(Event)
             .values(
@@ -47,8 +48,8 @@ def create_event(body: EventCreate):
                 destination=body.destination,
                 status="PENDING",
                 attempt_count=0,
-                created_at=utcnow(),
-                updated_at=utcnow(),
+                created_at=now,
+                updated_at=now,
             )
             .on_conflict_do_nothing(index_elements=["event_id"])
             .returning(Event.id)

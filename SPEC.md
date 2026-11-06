@@ -10,7 +10,7 @@ Later phases are outlined only and are expanded when we reach them.
 | 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | ✓ Done (live) |
 | 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ✓ Done (live) |
 | 2 | Bounded retries + "process pending" | Reviewed | ✓ Done |
-| 3 | HTTP destinations, timeouts, backoff, restart safety | Draft — needs review | ☐ |
+| 3 | HTTP destinations, timeouts, restart safety | Reviewed | ☐ |
 | 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
 
 ## Requirements coverage
@@ -135,7 +135,7 @@ Later phases are outlined only and are expanded when we reach them.
 | T13 | Duplicate submit after success | 200, `duplicate: true`, `status: SUCCEEDED` |
 | T14 | `GET /events/{id}` after `fail_twice` ×3 | 3 attempts in order with attempted_at, outcome, error |
 
-The simultaneous-deliver race is enforced by the DB unique rule and tested in Phase 3 with the delivery lock.
+The simultaneous-deliver race is enforced by the DB unique rule; it has no automated test (needs real concurrency). See D23 for the production approach.
 
 ---
 
@@ -199,11 +199,56 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 
 T17/T18 call Process several times in a row, which also proves the lease is released after each round.
 
-## Phase 3 — Resilience (outline)  ·  *Draft — needs review*
-- Destinations become real HTTP endpoints (`POST /sim/{behavior}`), called with `httpx` and a timeout; event id sent as `Idempotency-Key` header; `fail_twice` keeps its own counter table.
-- Backoff: `next_attempt_at` after each failure; process skips events not yet due.
-- Restart safety: `IN_PROGRESS` + lease, rows claimed with `FOR UPDATE SKIP LOCKED`. Guarantee: at-least-once.
-- Optional `slow` destination to demonstrate timeouts.
+## Phase 3 — Timeouts + restart safety  ·  *Reviewed*
+
+Brief: "Resilience patterns, including bounded retries and delivery timeouts." Bounded retries = Phase 2; this phase adds timeouts. Backoff is not built (D24).
+
+### Destinations become one HTTP route in the same app: `POST /sim/{name}`
+The sim route plays the **receiver** (the customer's webhook URL); `/deliver` and Process are the **sender**. It lives in the same app only so there is one thing to deploy (D22).
+
+| `name` | Behavior |
+|---|---|
+| `always_succeed` | 200 |
+| `fail_twice` | 500 when `X-Attempt-No` ≤ 2, otherwise 200 (D25) |
+| `always_fail` | 500 |
+| `slow` (**new**) | Waits `SIM_SLOW_SECONDS` (default 5), then 200 — longer than the timeout, so it always times out |
+
+- One handler, `async def`, waits with `asyncio.sleep` so a slow call doesn't block one of the worker threads that sync endpoints run on.
+- `slow` is added to the allowed destinations in `EventCreate`. No table change: `events.destination` stays text and now names the sim route to call.
+
+### Delivery call (inside `attempt_delivery`, replaces the in-process function call)
+- `POST {SIM_BASE_URL}/sim/{destination}` with httpx: payload as JSON body; headers `Idempotency-Key: <event_id>` and `X-Attempt-No: <attempt_no>`; timeout `DELIVERY_TIMEOUT_SECONDS` (default 2).
+- `SIM_BASE_URL` defaults to `http://127.0.0.1:$PORT` (`PORT` defaults to 8000 locally; Render sets it). This is the only setting that points at the receiver.
+- Attempt numbering is unchanged: `attempt_no = attempt_count + 1` from the DB, stored in `delivery_attempts`. The header only passes that number to the receiver.
+
+| Result | Outcome | `error` |
+|---|---|---|
+| 2xx | SUCCESS | — |
+| Non-2xx | FAILURE | `HTTP <code>` |
+| `httpx.TimeoutException` | FAILURE | `timeout after <n>s` |
+| Other `httpx.RequestError` | FAILURE | `request error: <type>` |
+
+- All failures count toward `MAX_ATTEMPTS` (D14).
+- New env vars `SIM_BASE_URL`, `DELIVERY_TIMEOUT_SECONDS`, `SIM_SLOW_SECONDS` listed in `.env.example`, all optional.
+
+### Restart safety (no new code)
+- The attempt and the event update commit **after** the call returns, in one transaction (unchanged). A crash mid-call commits nothing: the event stays `PENDING` with no attempt row and is retried next round. There is no `IN_PROGRESS` state, so nothing can get stuck. A crash mid-round leaves `process_lock`, which expires within 60 s (D21).
+- Guarantee: **at-least-once**. The receiver may get the same event twice; `Idempotency-Key` lets it deduplicate (D23).
+
+### Acceptance criteria (automated tests)
+| # | Test | Expected |
+|---|---|---|
+| — | All Phase 1–2 tests | Pass unchanged; in tests the sim calls go through `TestClient` (an httpx client) |
+| T24 | `always_fail` → deliver | FAILURE, error `HTTP 500` |
+| T25 | Delivery call raises `httpx.TimeoutException` (faked; no real 5 s wait) | FAILURE, error `timeout after 2s`, status `PENDING` |
+| T26 | Deliver any event | Request carries `Idempotency-Key` = event_id and `X-Attempt-No` = 1 |
+| T27 | `fail_twice` → deliver ×3 through `/sim` | FAILURE, FAILURE, SUCCESS |
+| T28 | Create an event with `destination: slow` | 201 (`slow` is accepted) |
+| T29 | `SIM_SLOW_SECONDS=0`, then `POST /sim/slow` directly | 200 (route exists and answers after its wait) |
+
+No automated end-to-end timeout test: `TestClient` runs the app in-process, and httpx timeouts are enforced by its network transport, so a `slow` call in tests would wait and return 200. T25 (timeout → FAILURE), T28 and T29 cover the pieces; the live check covers them together.
+
+Manual check after deploy: create a `slow` event on the live URL, deliver it, see `timeout after 2s` in its history.
 
 ## Phase 4 — Ship (outline)  ·  *Draft — needs review*
 - Single static HTML page: create form, events table, attempt history, "Process pending" and "Reset demo" buttons.
@@ -221,7 +266,7 @@ T17/T18 call Process several times in a row, which also proves the lease is rele
 | D4 | Payload compared as canonical JSON in the app; no hash column | Duplicates are found by event_id and payloads are small. At scale: store a SHA-256 of the canonical form |
 | D5 | Creating an event does not deliver it | Keeps each step visible and testable |
 | D6 | One destination per event | Matches the requirement; separate attempts table keeps multi-destination a small change |
-| D7 | Phase 1 destinations are in-process functions | Avoids the app calling itself over HTTP before the basics work; replaced in Phase 3 |
+| D7 | Phase 1 destinations are in-process functions | Avoids the app calling itself over HTTP before the basics work; replaced in Phase 3 (D22) |
 | D8 | No authentication | Demo app; reviewers must not need credentials |
 | D9 | Neon for local dev too (no Docker) | Docker not installed on the dev machine; one fewer moving part. Tests use a separate `webhooks_test` database |
 | D10 | Same id + different payload → **422** in every status, with error code `event_id_reused_with_different_payload` | Follows the IETF Idempotency-Key draft (draft-ietf-httpapi-idempotency-key-header). Distinct error code separates it from FastAPI validation 422s. A duplicate submit never modifies data; edits would need an explicit PUT allowed only before the first attempt |
@@ -236,6 +281,10 @@ T17/T18 call Process several times in a row, which also proves the lease is rele
 | D19 | `FAILED` is terminal; `/deliver` on it → 409 `already_failed` | Otherwise the limit isn't a limit. Retrying a failed event would be an explicit `POST /events/{id}/replay` (resets to `PENDING`, keeps history) — a follow-up, not built |
 | D20 | Process = one round, one transaction per event, summary counts only | The UI only needs counts and reloads the table; per-event transactions isolate failures; a Process vs `/deliver` conflict on one event is skipped, not counted |
 | D21 | Only one Process run at a time, enforced by a lease row (`process_lock`, 60 s, owner token, DB clock); second caller → 409 `process_already_running` | Two browsers can click at once, so a UI-only fix isn't enough. A lease (not a flag) recovers by itself after a crash. Advisory locks rejected: Neon's pooled connections don't hold session locks reliably. Phase 3: TTL must exceed the longest round (events × timeout), or renew per event. Production with `SKIP LOCKED` workers may allow parallel runs instead |
+| D22 | Destinations are one HTTP route in the same app (`POST /sim/{name}`), called with httpx and a timeout (replaces D7) | A real timeout needs a real network call; a Python function can't be stopped from outside. Same deploy, no extra service; `SIM_BASE_URL` is the only thing that points at the receiver. Production: the event references an `endpoints` table (customer URL, secret) |
+| D23 | Commit after the call; no `IN_PROGRESS` state; at-least-once delivery with `Idempotency-Key` | A crash can't leave a stuck event. Trade-off: the DB transaction (and a pooled connection) stays open during the call, up to the timeout. Production: claim with a lease + `FOR UPDATE SKIP LOCKED`, call outside the transaction, background worker instead of a button |
+| D24 | Backoff (`next_attempt_at`) not built | Needs a new column (`create_all` can't alter tables) and changes the Process round behavior; not in the brief. README: exponential backoff with jitter |
+| D25 | `fail_twice` decides from the `X-Attempt-No` header | The receiver can't see the sender's DB; a receiver-side counter table would add a table that reset must clear. Source of truth for attempts stays `delivery_attempts`; after a crash the retry is sent as the same attempt number again |
 
 ## AI usage log
 Record of where I questioned, corrected or rejected AI output (feeds the README section).
@@ -261,9 +310,10 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 6 | AI reported spec updates as done | Noticed several times the file on disk had not changed; flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
 | Nov 6 | `status`/`outcome` as plain `str` in output schemas | During my code walkthrough I asked why `status` had no `Literal`; added `Literal` types to three fields by hand (D17) | Server-owned values should still be constrained; catches typos, documents the enum | `pytest` passes |
 | Nov 6 | Hard-coded `MAX_ATTEMPTS = 5` | Made it an env var (D18) | Limit may change per environment without a code change | T21 |
-| Nov 6 | A `skipped` count in the process response | Questioned it; dropped it (D20) | Untestable in Phase 2 and always 0 once Phase 3 adds `SKIP LOCKED` | Spec review |
+| Nov 6 | A `skipped` count in the process response | Questioned it; dropped it (D20) | Untestable in Phase 2, and always 0 with `SKIP LOCKED` workers (production design) | Spec review |
 | Nov 6 | (my idea) `FAILED_TRANSIENT` / `FAILED_PERMANENT` statuses | Deferred; retryability belongs to the attempt's error, not the event's status (D14) | A transient failure under the limit is just `PENDING`; no simulated destination returns a permanent error | Spec review |
 | Nov 6 | No lock on Process (unique constraint keeps data correct; disable the button in the UI) | Required a lock: two browsers can click at once, and a disabled button only protects one tab. Chose a lease row over a flag (crash recovery) and over an advisory lock (Neon pooler) (D21) | A double run gives events extra early attempts and inconsistent counts | T22, T23 |
+| Nov 6 | Claude proposed possibly cutting Phase 3 timeouts to save time | Checked the brief ("Resilience patterns, including bounded retries and delivery timeouts") and kept timeouts; cut backoff and the `IN_PROGRESS`/lease code instead (D23, D24) | Timeouts are an explicit requirement; backoff is not | Re-read the brief |
 | Nov 6 | (I noticed only `list_events` had a `response_model`) Claude suggested adding one to every route | Asked whether it was needed for routes with several outcomes; decided to skip it | Those routes return several status codes and bodies; a `response_model` would document only one success shape and isn't applied when a `JSONResponse` is returned | Code review |
 
 ### Issues caught when Claude reviewed Claude Code's plans (I approved and applied each fix)

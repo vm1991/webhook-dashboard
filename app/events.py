@@ -20,7 +20,7 @@ from app.schemas import (
     EventOut,
 )
 
-router = APIRouter()
+router = APIRouter(prefix="/events")
 
 
 def canonical(payload: Any) -> str:
@@ -35,7 +35,7 @@ def respond(status: int, model) -> JSONResponse:
     return JSONResponse(status_code=status, content=jsonable_encoder(model))
 
 
-@router.post("/events")
+@router.post("")
 def create_event(body: EventCreate):
     with db.SessionLocal() as session:
         # The DB unique constraint decides who wins; never "check then insert".
@@ -77,7 +77,7 @@ def create_event(body: EventCreate):
         )
 
 
-@router.post("/events/{event_id}/deliver")
+@router.post("/{event_id}/deliver")
 def deliver_event(event_id: str):
     with db.SessionLocal() as session:
         event = session.scalar(select(Event).where(Event.event_id == event_id))
@@ -121,7 +121,7 @@ def deliver_event(event_id: str):
         )
 
 
-@router.get("/events", response_model=list[EventListItem])
+@router.get("", response_model=list[EventListItem])
 def list_events():
     with db.SessionLocal() as session:
         rows = session.scalars(
@@ -130,7 +130,7 @@ def list_events():
         return [EventListItem.model_validate(r) for r in rows]
 
 
-@router.get("/events/{event_id}")
+@router.get("/{event_id}")
 def get_event(event_id: str):
     with db.SessionLocal() as session:
         event = session.scalar(select(Event).where(Event.event_id == event_id))

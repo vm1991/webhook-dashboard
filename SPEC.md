@@ -176,6 +176,24 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 ## AI usage log
 Record each AI suggestion that was corrected or rejected (feeds the README section).
 
-| Date | Suggestion | What I did | Why |
-|---|---|---|---|
-| | | | |
+**Tools:** Claude (chat, in the desktop app) for planning, spec review and code review; Claude Code (VS Code extension) for implementation. Every Claude Code change started from a file plan I approved, and I reviewed every diff and ran the tests before committing.
+
+**How I checked output:** compared each plan against `SPEC.md` before approving; read every diff; ran `pytest` locally and smoke-tested the live URL after each push; verified API design choices against primary sources (IETF Idempotency-Key draft, Stripe docs) rather than taking the AI's word.
+
+| Date | Tool | Suggestion | What I did | Why |
+|---|---|---|---|---|
+| Nov 5 | Claude | First spec draft covered everything at once (multiple tables, leases, backoff, optional destinations) | Rejected; rescoped into small phases (0–4), each working end to end | Too much to review and build at once; phases keep each diff small and reviewable |
+| Nov 5 | Claude | Local Postgres in Docker | Dropped; used Neon for local dev and live, separate test database | Docker not installed; one fewer moving part (D9) |
+| Nov 5 | Claude Code | Phase 0 plan used Neon's `postgresql://` URL as-is | Required converting it to `postgresql+psycopg://` | SQLAlchemy reads the plain scheme as psycopg2, which isn't installed; the app would crash on startup |
+| Nov 5 | Claude Code | `/health` 503 test planned with tables created at startup | Required simulating the DB failure *after* startup (monkeypatch), not an unreachable host | With startup DB init, the app never starts when the DB is down, so the 503 path could never be tested; a fake host can also hang the test |
+| Nov 5 | Claude Code | Engine without connection health checks; unpinned dependencies; deprecated `on_event` startup | Added `pool_pre_ping=True`, pinned versions, used the lifespan handler | Neon suspends idle connections; reproducible Render builds; current FastAPI API |
+| Nov 5 | Claude Code | Test setup failed with `ModuleNotFoundError: app` | Added `pytest.ini` with `pythonpath = .` | Plain `pytest` doesn't put the repo root on the import path |
+| Nov 6 | Claude | Store a `payload_hash` column to detect duplicates | Dropped it; compare canonical JSON in the app (D4) | Duplicates are found by `event_id` and payloads are small, so a hash adds a column for no benefit. Also rejected plain `dict == dict` because Python treats `True == 1` |
+| Nov 6 | Claude | Name the attempts foreign key `event_id` while pointing at `events.id` | Renamed to `event_pk` | Two different things named `event_id` would be confusing in code and in the walkthrough |
+| Nov 6 | Me → Claude | I proposed choosing the destination at delivery time | Kept it at create time after discussing it (D13) | The "process pending" retry needs to know where to send; per-attempt destinations would need per-destination status. Kept as the answer to a "multiple destinations" follow-up |
+| Nov 6 | Claude | Same ID + different payload → 409 | Changed to **422** with a distinct error code (D10) | Checked the IETF Idempotency-Key draft, which specifies 422 for key reuse with a different payload |
+| Nov 6 | Me → Claude | I proposed 409 for an exact duplicate while the event is still `PENDING` | Kept **200** with current status after checking the IETF draft and Stripe docs (D11) | Their 409 is for a retry while the original *request* is still in flight; `PENDING` is business state, and a retry must get a success response |
+| Nov 6 | Me → Claude | I proposed letting a pending event's payload be overwritten | Rejected (D10) | Attempts may already have sent the old payload; overwrites make retries unsafe (last write wins) |
+| Nov 6 | Claude | Transient vs permanent failure classes | Out of scope (D14) | `always_fail` must be retried to demonstrate the limit; noted as a production change |
+| Nov 6 | Claude Code | Offered a global handler mapping all `SQLAlchemyError` to 503 | Narrowed to `OperationalError` only; confirmed `IntegrityError` on deliver returns 409 `delivery_conflict` | 503 means "try later"; constraint violations are conflicts or bugs and shouldn't be masked as unavailability |
+| Nov 6 | — | Router with `prefix="/events"` | Used `""` (not `"/"`) for collection routes | `"/"` makes the path `/events/` and causes a 307 redirect from `/events`, which can drop POST bodies |

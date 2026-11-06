@@ -8,7 +8,7 @@ Later phases are outlined only and are expanded when we reach them.
 | Phase | Scope | Spec | Build |
 |---|---|---|---|
 | 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | ✓ Done (live) |
-| 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ☐ |
+| 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ✓ Done (live) |
 | 2 | Bounded retries + "process pending" | Draft — needs review | ☐ |
 | 3 | HTTP destinations, timeouts, backoff, restart safety | Draft — needs review | ☐ |
 | 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
@@ -95,7 +95,7 @@ Later phases are outlined only and are expanded when we reach them.
 | Same `event_id`, same payload and destination (any status) | **200** | Existing event with current status, `"duplicate": true`, `"message": "Event already submitted"`. Nothing changes. |
 | Same `event_id`, different payload or destination (any status) | **422** | `"error": "event_id_reused_with_different_payload"` + message to use a new event_id. Original unchanged. Follows the IETF Idempotency-Key draft. |
 | Different `event_id`, same payload | **201** | A separate event (the ID identifies an event, not its content) |
-| Invalid input (missing field, bad JSON, payload not an object, unknown destination, empty id) | **422** | FastAPI's standard validation error (`"detail": [...]`) |
+| Invalid input (missing field, bad JSON, payload not an object, unknown destination, empty id, id with characters other than letters, digits, `_`, `-`) | **422** | FastAPI's standard validation error (`"detail": [...]`) |
 
 - Payloads are compared in the app as **canonical JSON** (`json.dumps(sort_keys=True, separators=(",", ":"))`), so key order and whitespace don't matter. Not `dict == dict`, because Python treats `True == 1`. `1` and `1.0` count as different payloads.
 - Safe under concurrent duplicate submits: rely on the DB unique constraint (`INSERT … ON CONFLICT DO NOTHING`, then compare), never "check then insert". A simultaneous duplicate waits on the unique index, then sees the committed row.
@@ -122,9 +122,11 @@ Later phases are outlined only and are expanded when we reach them.
 | T2 | Same id + same payload twice | 2nd call 200, `duplicate: true`; 1 row in DB |
 | T3 | Same id, keys in a different order | 200 (treated as identical) |
 | T4 | Same id, different payload | 422 `event_id_reused_with_different_payload`; stored payload unchanged |
+| T4.2 | Same id, payload `{"a": true}` then `{"a": 1}` | 422 (canonical JSON tells `true` from `1`) |
 | T5 | Same id + payload, different destination | 422 |
 | T6 | Different ids, same payload | 201, 201; two rows |
 | T7 | Unknown destination | 422 (validation) |
+| T7.2 | `event_id` containing `/` | 422 (validation) |
 | T8 | `always_succeed` → deliver | 200, `SUCCEEDED`, 1 attempt `SUCCESS` |
 | T9 | `fail_twice` → deliver ×3 | FAILURE, FAILURE, SUCCESS; `SUCCEEDED`, attempt_count 3 |
 | T10 | `always_fail` → deliver | 200, outcome FAILURE, error recorded, status `PENDING` |
@@ -172,6 +174,9 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 | D12 | A failed delivery attempt returns 200 | The API call worked; the destination's failure is data in the body |
 | D13 | Destination chosen at create time | Retries need to know where to send. One event → many destinations would need a `deliveries` table (likely follow-up change) |
 | D14 | All failures are retryable until the limit; no transient/permanent split | Keeps scope minimal; `always_fail` must be retried to demonstrate the limit. Production would treat 4xx (except 408/429) as permanent |
+| D15 | DB connection errors (`OperationalError`) → **503** `{"error": "database_unavailable"}`, no details in the body | 503 means "try again later". Constraint violations (`IntegrityError`) are not caught here: on deliver they become 409, anything else stays 500 so bugs aren't hidden |
+| D16 | `event_id` limited to letters, digits, `_`, `-` | The id is used in URL paths: `/` would make the event unreachable (404), `.`/`..` get rewritten by clients |
+| D17 | `status` and `outcome` typed as `Literal` in the output models | Server-owned values are still constrained: a typo fails loudly, and `/docs` shows the allowed values. Production: also a DB `CHECK` constraint (needs table recreate, since `create_all` doesn't alter tables) |
 
 ## AI usage log
 Record of where I questioned, corrected or rejected AI output (feeds the README section).
@@ -195,6 +200,7 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 6 | Claude Code offered to map all DB errors to 503 | Approved only a narrower handler: connection errors (`OperationalError`) → 503; confirmed constraint violations on deliver → 409 | 503 means "try later"; conflicts and bugs must not be masked as unavailability | Added a 503 test |
 | Nov 6 | Routes defined with full paths | Moved event routes under `APIRouter(prefix="/events")`, using `""` not `"/"` for collection routes | Cleaner routing; `"/"` would cause a 307 redirect from `/events` | `pytest` passes unchanged |
 | Nov 6 | AI reported spec updates as done | Noticed several times the file on disk had not changed; flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
+| Nov 6 | `status`/`outcome` as plain `str` in output schemas | During my code walkthrough I asked why `status` had no `Literal`; added `Literal` types to three fields by hand (D17) | Server-owned values should still be constrained; catches typos, documents the enum | `pytest` passes |
 
 ### Issues caught when Claude reviewed Claude Code's plans (I approved and applied each fix)
 | Date | Claude Code's plan | Fix applied | Why | How I verified |
@@ -203,3 +209,5 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 5 | 503 test with tables created at startup | Simulate DB failure *after* startup (monkeypatch) | Otherwise the app can't start when the DB is down, so 503 is untestable | 503 test passes |
 | Nov 5 | No connection health check; unpinned deps; deprecated `on_event` | `pool_pre_ping=True`, pinned versions, lifespan handler | Neon suspends idle connections; reproducible builds | Live `/health` after idle period |
 | Nov 5 | `pytest` failed: `ModuleNotFoundError: app` | Added `pytest.ini` (`pythonpath = .`) | Repo root wasn't on the import path | `pytest` passes |
+| Nov 6 | `event_id` accepted any non-empty string | Claude flagged in the code walkthrough that an id with `/` can be created but never fetched; I added the pattern and test T7.2 by hand (D16) | Path parameters don't match `/` | T7.2 passes |
+| Nov 6 | No test for the `True == 1` case that motivated canonical JSON | Claude suggested it; I wrote T4.2 by hand | The test should prove the reason for the design | T4.2 passes |

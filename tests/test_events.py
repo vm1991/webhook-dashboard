@@ -48,12 +48,18 @@ def test_t3_key_order_does_not_matter(client):
     assert r.json()["duplicate"] is True
 
 
-def test_t4_same_id_different_payload(client):
+def test_t4_1_same_id_different_payload(client):
     client.post("/events", json=body(payload={"a": 1}))
     r = client.post("/events", json=body(payload={"a": 2}))
     assert r.status_code == 422
     assert r.json()["error"] == "event_id_reused_with_different_payload"
     assert stored_payload("evt-1") == {"a": 1}
+
+
+def test_t4_2_true_and_1_are_different_payloads(client):
+    client.post("/events", json=body(payload={"a": True}))
+    r = client.post("/events", json=body(payload={"a": 1}))
+    assert r.status_code == 422
 
 
 def test_t5_same_id_payload_different_destination(client):
@@ -71,6 +77,12 @@ def test_t6_different_ids_same_payload(client):
 
 def test_t7_unknown_destination(client):
     r = client.post("/events", json=body(destination="nope"))
+    assert r.status_code == 422
+    assert "detail" in r.json()
+    
+
+def test_t7_2_event_id_with_slash_rejected(client):
+    r = client.post("/events", json=body(event_id="a/b"))
     assert r.status_code == 422
     assert "detail" in r.json()
 

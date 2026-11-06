@@ -50,6 +50,13 @@ class EventDetail(EventOut):
     attempts: list[AttemptOut]
 
 
+class ProcessSummary(BaseModel):
+    processed: int
+    succeeded: int
+    failed: int
+    still_pending: int
+
+
 class DeliverResult(BaseModel):
     event: EventOut
     attempt: AttemptOut

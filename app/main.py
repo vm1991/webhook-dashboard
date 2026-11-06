@@ -5,17 +5,20 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from app import db, events
+from app import db, deliveries, events
+from app.config import get_max_attempts
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    get_max_attempts()  # fail at startup on an invalid MAX_ATTEMPTS
     yield
 
 
 app = FastAPI(title="Webhook Delivery Dashboard", lifespan=lifespan)
 app.include_router(events.router)
+app.include_router(deliveries.router)
 
 
 @app.exception_handler(OperationalError)

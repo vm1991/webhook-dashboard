@@ -6,9 +6,9 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 
-from app import db, destinations
+from app import db
+from app.deliveries import attempt_delivery
 from app.models import DeliveryAttempt, Event, utcnow
 from app.schemas import (
     AttemptOut,
@@ -87,32 +87,15 @@ def deliver_event(event_id: str):
         if event.status == "SUCCEEDED":
             return error(409, "already_succeeded", "Event was already delivered")
 
-        attempt_no = event.attempt_count + 1
-        ok, err = destinations.deliver(event)
-        now = utcnow()
+        if event.status == "FAILED":
+            return error(409, "already_failed", "Event reached the attempt limit")
 
-        attempt = DeliveryAttempt(
-            event_pk=event.id,
-            attempt_no=attempt_no,
-            attempted_at=now,
-            outcome="SUCCESS" if ok else "FAILURE",
-            error=None if ok else err,
-        )
-        session.add(attempt)
-        event.attempt_count = attempt_no
-        event.updated_at = now
-        if ok:
-            event.status = "SUCCEEDED"
-
-        try:
-            session.commit()  # attempt INSERT + event UPDATE in one transaction
-        except IntegrityError:
-            session.rollback()
+        attempt = attempt_delivery(session, event)
+        if attempt is None:
             return error(
                 409, "delivery_conflict", "Another delivery for this event is in progress"
             )
 
-        session.refresh(event)
         return respond(
             200,
             DeliverResult(

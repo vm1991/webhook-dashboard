@@ -9,7 +9,7 @@ Later phases are outlined only and are expanded when we reach them.
 |---|---|---|---|
 | 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | ✓ Done (live) |
 | 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ✓ Done (live) |
-| 2 | Bounded retries + "process pending" | Draft — needs review | ☐ |
+| 2 | Bounded retries + "process pending" | Reviewed | ✓ Done |
 | 3 | HTTP destinations, timeouts, backoff, restart safety | Draft — needs review | ☐ |
 | 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
 
@@ -24,7 +24,7 @@ Later phases are outlined only and are expanded when we reach them.
 | 6 | Retained across refresh and restart | Phase 0 (Postgres), Phase 3 (restart mid-delivery) |
 | — | Delivery timeouts | Phase 3 |
 | — | Browser UI, seed data, reset | Phase 4 |
-| — | Tests: duplicates, retry limit, failed → successful | Phase 1 (T2, T4, T9), Phase 2 (retry limit) |
+| — | Tests: duplicates, retry limit, failed → successful | Phase 1 (T2, T4, T9), Phase 2 (T15, T17, T18) |
 
 ## Stack
 - Python 3.13, FastAPI, SQLAlchemy 2.x, PostgreSQL, pytest
@@ -139,10 +139,65 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 
 ---
 
-## Phase 2 — Bounded retries (outline)  ·  *Draft — needs review*
-- Max attempts (default 5); after the last failure, status `FAILED` (terminal).
-- `POST /deliveries/process` → one attempt for every eligible `PENDING` event.
-- Tests: retry limit stops at max; fail → fail → success via process.
+## Phase 2 — Bounded retries + process pending  ·  *Reviewed*
+
+### Config
+- `MAX_ATTEMPTS` env var: **total** attempts per event (1 first try + retries). Default `5`, must be an integer ≥ 1 (invalid → error). Read at delivery time, so tests can override it. Listed in `.env.example`.
+
+### Rules
+- A failed attempt with `attempt_no >= MAX_ATTEMPTS` sets status `FAILED` (terminal), in the same transaction as the attempt. `>=` (not `==`) so lowering the limit later doesn't leave events stuck in `PENDING`.
+- Statuses: `PENDING` → `SUCCEEDED` | `FAILED`. No change to `events` (status is text).
+- Duplicate submit (`POST /events`, same id + payload) of a `FAILED` event → 200, `duplicate: true`, `status: FAILED` (D11). Resubmitting is not a replay.
+
+### Data model (new table)
+**process_lock** — at most one row; a lease so only one Process run happens at a time (D21)
+| Column | Type | Rule |
+|---|---|---|
+| id | integer | primary key; always `1` |
+| owner | text | not null; random token of the run holding the lease |
+| locked_until | timestamptz | not null; lease expiry (DB clock) |
+
+- New table, so `create_all` creates it on startup; existing tables are untouched (no reset needed).
+- **Acquire** (one atomic statement): `INSERT INTO process_lock (id, owner, locked_until) VALUES (1, :owner, now() + interval '60 seconds') ON CONFLICT (id) DO UPDATE SET owner = EXCLUDED.owner, locked_until = EXCLUDED.locked_until WHERE process_lock.locked_until < now()`. 1 row affected → acquired; 0 → another run holds it.
+- **Release** in `finally`: `UPDATE process_lock SET locked_until = now() WHERE id = 1 AND owner = :owner` (owner check: an expired slow run can't release a newer run's lease).
+- Crash mid-round → lease expires after 60 s; Process works again.
+
+### API changes
+**`POST /events/{event_id}/deliver`** — new case:
+| Case | Code | Body |
+|---|---|---|
+| Event already `FAILED` | **409** | `"error": "already_failed"`; no attempt made |
+
+**`POST /deliveries/process`** — one retry round (backs the "Process pending" button).
+- Acquires the `process_lock` lease first; released when the round ends (success or error).
+- Every `PENDING` event, oldest first (`created_at`, `id`), gets **one attempt**. One round per call, no loop.
+- Uses the same attempt logic as `/deliver` (one shared helper). **Each event in its own transaction**, so one failure doesn't undo the others.
+- If an event hits a concurrent-delivery conflict with `/deliver` (`IntegrityError`), that event is rolled back, not counted, and the round continues.
+
+| Case | Code | Body |
+|---|---|---|
+| Round ran | **200** | `{"processed", "succeeded", "failed", "still_pending"}` |
+| Another run holds the lease | **409** | `"error": "process_already_running"`; no attempts made |
+
+- `succeeded`: moved to `SUCCEEDED` this round
+- `failed`: reached the limit, moved to `FAILED` this round
+- `still_pending`: attempt failed, still under the limit
+- `processed` = succeeded + failed + still_pending
+
+### Acceptance criteria (automated tests)
+| # | Test | Expected |
+|---|---|---|
+| T15 | `always_fail` → deliver ×5 | Attempts 1–4 → `PENDING`; 5th → `FAILED`, attempt_count 5 |
+| T16 | Deliver a `FAILED` event | 409 `already_failed`; still 5 attempts |
+| T17 | One event per destination → process ×3 | Round 1: processed 3, succeeded 1, still_pending 2 (`always_succeed` → `SUCCEEDED`). Round 2: processed 2, still_pending 2 (`always_succeed` not picked). Round 3: processed 2, succeeded 1, still_pending 1 (`fail_twice` → `SUCCEEDED` on attempt 3; `always_fail` `PENDING`, 3 attempts) |
+| T18 | `always_fail` → process ×6 | Rounds 1–4: still_pending 1. Round 5: failed 1 → `FAILED`. Round 6: processed 0; still 5 attempts |
+| T19 | Process with nothing pending | 200, all counts 0 |
+| T20 | Duplicate submit of a `FAILED` event | 200, `duplicate: true`, `status: FAILED` |
+| T21 | `MAX_ATTEMPTS=2`, `always_fail` → deliver ×2 | `FAILED` after 2 attempts |
+| T22 | Lock row held (`locked_until` in the future), then process | 409 `process_already_running`; no new attempts |
+| T23 | Lock row expired (`locked_until` in the past), then process | 200, round runs (recovery after a crash) |
+
+T17/T18 call Process several times in a row, which also proves the lease is released after each round.
 
 ## Phase 3 — Resilience (outline)  ·  *Draft — needs review*
 - Destinations become real HTTP endpoints (`POST /sim/{behavior}`), called with `httpx` and a timeout; event id sent as `Idempotency-Key` header; `fail_twice` keeps its own counter table.
@@ -173,10 +228,14 @@ The simultaneous-deliver race is enforced by the DB unique rule and tested in Ph
 | D11 | Exact duplicate → **200** with current state in every status (incl. `PENDING`) | A retry must get a success response. IETF's 409 "still processing" applies only while the original request is in flight; create is a single atomic insert, so it can't occur here. PENDING is business state, not an in-flight request |
 | D12 | A failed delivery attempt returns 200 | The API call worked; the destination's failure is data in the body |
 | D13 | Destination chosen at create time | Retries need to know where to send. One event → many destinations would need a `deliveries` table (likely follow-up change) |
-| D14 | All failures are retryable until the limit; no transient/permanent split | Keeps scope minimal; `always_fail` must be retried to demonstrate the limit. Production would treat 4xx (except 408/429) as permanent |
+| D14 | All failures are retryable until the limit; no transient/permanent split | Keeps scope minimal; `always_fail` must be retried to demonstrate the limit. Production would treat 4xx (except 408/429) as permanent. Retryability belongs to the attempt's error (e.g. a `retryable` flag on attempts), not to event status |
 | D15 | DB connection errors (`OperationalError`) → **503** `{"error": "database_unavailable"}`, no details in the body | 503 means "try again later". Constraint violations (`IntegrityError`) are not caught here: on deliver they become 409, anything else stays 500 so bugs aren't hidden |
 | D16 | `event_id` limited to letters, digits, `_`, `-` | The id is used in URL paths: `/` would make the event unreachable (404), `.`/`..` get rewritten by clients |
 | D17 | `status` and `outcome` typed as `Literal` in the output models | Server-owned values are still constrained: a typo fails loudly, and `/docs` shows the allowed values. Production: also a DB `CHECK` constraint (needs table recreate, since `create_all` doesn't alter tables) |
+| D18 | `MAX_ATTEMPTS` = total attempts, from env, default 5 | It's the number you see in the history (`attempt_no`); changeable without a code change |
+| D19 | `FAILED` is terminal; `/deliver` on it → 409 `already_failed` | Otherwise the limit isn't a limit. Retrying a failed event would be an explicit `POST /events/{id}/replay` (resets to `PENDING`, keeps history) — a follow-up, not built |
+| D20 | Process = one round, one transaction per event, summary counts only | The UI only needs counts and reloads the table; per-event transactions isolate failures; a Process vs `/deliver` conflict on one event is skipped, not counted |
+| D21 | Only one Process run at a time, enforced by a lease row (`process_lock`, 60 s, owner token, DB clock); second caller → 409 `process_already_running` | Two browsers can click at once, so a UI-only fix isn't enough. A lease (not a flag) recovers by itself after a crash. Advisory locks rejected: Neon's pooled connections don't hold session locks reliably. Phase 3: TTL must exceed the longest round (events × timeout), or renew per event. Production with `SKIP LOCKED` workers may allow parallel runs instead |
 
 ## AI usage log
 Record of where I questioned, corrected or rejected AI output (feeds the README section).
@@ -201,6 +260,11 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 6 | Routes defined with full paths | Moved event routes under `APIRouter(prefix="/events")`, using `""` not `"/"` for collection routes | Cleaner routing; `"/"` would cause a 307 redirect from `/events` | `pytest` passes unchanged |
 | Nov 6 | AI reported spec updates as done | Noticed several times the file on disk had not changed; flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
 | Nov 6 | `status`/`outcome` as plain `str` in output schemas | During my code walkthrough I asked why `status` had no `Literal`; added `Literal` types to three fields by hand (D17) | Server-owned values should still be constrained; catches typos, documents the enum | `pytest` passes |
+| Nov 6 | Hard-coded `MAX_ATTEMPTS = 5` | Made it an env var (D18) | Limit may change per environment without a code change | T21 |
+| Nov 6 | A `skipped` count in the process response | Questioned it; dropped it (D20) | Untestable in Phase 2 and always 0 once Phase 3 adds `SKIP LOCKED` | Spec review |
+| Nov 6 | (my idea) `FAILED_TRANSIENT` / `FAILED_PERMANENT` statuses | Deferred; retryability belongs to the attempt's error, not the event's status (D14) | A transient failure under the limit is just `PENDING`; no simulated destination returns a permanent error | Spec review |
+| Nov 6 | No lock on Process (unique constraint keeps data correct; disable the button in the UI) | Required a lock: two browsers can click at once, and a disabled button only protects one tab. Chose a lease row over a flag (crash recovery) and over an advisory lock (Neon pooler) (D21) | A double run gives events extra early attempts and inconsistent counts | T22, T23 |
+| Nov 6 | (I noticed only `list_events` had a `response_model`) Claude suggested adding one to every route | Asked whether it was needed for routes with several outcomes; decided to skip it | Those routes return several status codes and bodies; a `response_model` would document only one success shape and isn't applied when a `JSONResponse` is returned | Code review |
 
 ### Issues caught when Claude reviewed Claude Code's plans (I approved and applied each fix)
 | Date | Claude Code's plan | Fix applied | Why | How I verified |
@@ -211,3 +275,5 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 5 | `pytest` failed: `ModuleNotFoundError: app` | Added `pytest.ini` (`pythonpath = .`) | Repo root wasn't on the import path | `pytest` passes |
 | Nov 6 | `event_id` accepted any non-empty string | Claude flagged in the code walkthrough that an id with `/` can be created but never fetched; I added the pattern and test T7.2 by hand (D16) | Path parameters don't match `/` | T7.2 passes |
 | Nov 6 | No test for the `True == 1` case that motivated canonical JSON | Claude suggested it; I wrote T4.2 by hand | The test should prove the reason for the design | T4.2 passes |
+| Nov 6 | Process loaded the PENDING ids, then attempted each event without checking its status again | Load each event in its own session and skip it unless still `PENDING` | A concurrent `/deliver` could finish the event in between, and Process would then attempt an already `SUCCEEDED` event | Read the full Phase 2 diff myself and confirmed the check; `pytest` passes |
+| Nov 6 | Lock acquire and release not specified as separate transactions | Acquire commits immediately in its own session; release uses a fresh session in `finally` | Otherwise a second caller blocks on the row lock instead of getting 409, and a failed round could fail to release | Read the diff myself; T22, T23 pass |

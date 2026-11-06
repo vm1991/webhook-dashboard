@@ -28,6 +28,16 @@ class Event(Base):
     )
 
 
+class ProcessLock(Base):
+    __tablename__ = "process_lock"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    owner: Mapped[str] = mapped_column(Text, nullable=False)
+    locked_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class DeliveryAttempt(Base):
     __tablename__ = "delivery_attempts"
     __table_args__ = (UniqueConstraint("event_pk", "attempt_no"),)

@@ -22,6 +22,6 @@ def client():
         # Tables exist after startup; start every test from an empty DB.
         with db.engine.begin() as conn:
             conn.execute(
-                text("TRUNCATE delivery_attempts, events RESTART IDENTITY")
+                text("TRUNCATE delivery_attempts, events, process_lock RESTART IDENTITY")
             )
         yield c

@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 from app import db, seed
 
-SEED_IDS = {"seed-always-succeed", "seed-fail-twice", "seed-always-fail", "seed-slow"}
+SEED_IDS = {"seed-always-succeed", "seed-fail-twice", "seed-always-fail", "seed-always-timeout"}
 
 
 def _make_event(client, event_id, destination="always_fail"):

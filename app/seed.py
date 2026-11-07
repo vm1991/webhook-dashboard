@@ -14,7 +14,7 @@ SEED_EVENTS = [
     ("seed-always-succeed", "always_succeed"),
     ("seed-fail-twice", "fail_twice"),
     ("seed-always-fail", "always_fail"),
-    ("seed-slow", "slow"),
+    ("seed-always-timeout", "always_timeout"),
 ]
 
 

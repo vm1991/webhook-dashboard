@@ -53,10 +53,10 @@ def test_t27_fail_twice_through_sim(client):
     assert outcomes == ["FAILURE", "FAILURE", "SUCCESS"]
 
 
-def test_t28_slow_destination_accepted(client):
-    assert create(client, "slow").status_code == 201
+def test_t28_always_timeout_destination_accepted(client):
+    assert create(client, "always_timeout").status_code == 201
 
 
-def test_t29_sim_slow_route_answers(client, monkeypatch):
+def test_t29_sim_always_timeout_route_answers(client, monkeypatch):
     monkeypatch.setenv("SIM_SLOW_SECONDS", "0")
-    assert client.post("/sim/slow").status_code == 200
+    assert client.post("/sim/always_timeout").status_code == 200

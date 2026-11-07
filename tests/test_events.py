@@ -104,3 +104,10 @@ def test_database_unavailable_returns_503(client, monkeypatch):
     r = client.post("/events", json=body())
     assert r.status_code == 503
     assert r.json() == {"error": "database_unavailable"}
+
+
+def test_list_events_includes_payload(client):
+    payload = {"order_id": 1001, "items": [1, 2], "nested": {"a": True}}
+    client.post("/events", json=body("p-1", payload))
+    rows = client.get("/events").json()
+    assert rows[0]["payload"] == payload

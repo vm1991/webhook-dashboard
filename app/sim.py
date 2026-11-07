@@ -8,7 +8,7 @@ from app.config import get_sim_slow_seconds
 
 router = APIRouter(prefix="/sim")
 
-_NAMES = {"always_succeed", "fail_twice", "always_fail", "slow"}
+_NAMES = {"always_succeed", "fail_twice", "always_fail", "always_timeout"}
 
 
 @router.post("/{name}")
@@ -21,6 +21,6 @@ async def sim(name: str, request: Request):
         attempt_no = int(request.headers.get("X-Attempt-No", "1"))
         if attempt_no <= 2:
             return JSONResponse(status_code=500, content={"ok": False})
-    if name == "slow":
+    if name == "always_timeout":
         await asyncio.sleep(get_sim_slow_seconds())
     return {"ok": True}

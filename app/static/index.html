@@ -17,7 +17,7 @@
       <option>always_succeed</option>
       <option>fail_twice</option>
       <option>always_fail</option>
-      <option>slow</option>
+      <option>always_timeout</option>
     </select></label></p>
   <button type="submit">Create event</button>
 </form>
@@ -47,7 +47,7 @@
 
 <h2>Events</h2>
 <table id="events" border="1">
-  <thead><tr><th>event_id</th><th>destination</th><th>status</th><th>attempts</th><th>created</th></tr></thead>
+  <thead><tr><th>event_id</th><th>destination</th><th>status</th><th>attempts</th><th>created</th><th>Payload</th><th></th></tr></thead>
   <tbody></tbody>
 </table>
 
@@ -84,11 +84,56 @@ function cell(row, text) {
   row.appendChild(td);
 }
 
+const openRows = new Set(); // event_ids whose attempts row is open
+const EVENT_COLUMNS = 7;
+
+// A row directly under an event row: one <td colspan> holding a small attempts table.
+function attemptsRow(r) {
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = EVENT_COLUMNS;
+  if (r.status !== 200 || !r.body || !Array.isArray(r.body.attempts)) {
+    td.textContent = "Could not load attempts (HTTP " + r.status + ")";
+  } else if (r.body.attempts.length === 0) {
+    td.textContent = "No attempts yet";
+  } else {
+    const table = document.createElement("table");
+    table.border = "1";
+    const head = document.createElement("tr");
+    for (const h of ["attempt_no", "time", "outcome", "error"]) {
+      const th = document.createElement("th");
+      th.textContent = h;
+      head.appendChild(th);
+    }
+    table.appendChild(head);
+    for (const a of r.body.attempts) {
+      const row = document.createElement("tr");
+      cell(row, a.attempt_no);
+      cell(row, a.attempted_at);
+      cell(row, a.outcome);
+      cell(row, a.error);
+      table.appendChild(row);
+    }
+    td.appendChild(table);
+  }
+  tr.appendChild(td);
+  return tr;
+}
+
+async function toggleRow(eventId) {
+  if (openRows.has(eventId)) openRows.delete(eventId);
+  else openRows.add(eventId);
+  await refreshEvents();
+}
+
 async function refreshEvents() {
   const r = await call("GET", "/events");
   const tbody = document.querySelector("#events tbody");
   tbody.replaceChildren();
   if (r.status !== 200 || !Array.isArray(r.body)) return;
+  const known = new Set(r.body.map((e) => e.event_id));
+  for (const id of [...openRows]) if (!known.has(id)) openRows.delete(id); // e.g. after a reset
+  const open = [];
   for (const e of r.body) {
     const tr = document.createElement("tr");
     cell(tr, e.event_id);
@@ -96,8 +141,32 @@ async function refreshEvents() {
     cell(tr, e.status);
     cell(tr, e.attempt_count);
     cell(tr, e.created_at);
+
+    const payloadCell = document.createElement("td");
+    const pre = document.createElement("pre");
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-word";
+    pre.style.maxWidth = "30em";
+    pre.textContent = JSON.stringify(e.payload, null, 2);
+    payloadCell.appendChild(pre);
+    tr.appendChild(payloadCell);
+
+    const buttonCell = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "History";
+    btn.addEventListener("click", () => toggleRow(e.event_id));
+    buttonCell.appendChild(btn);
+    tr.appendChild(buttonCell);
+
     tbody.appendChild(tr);
+    if (openRows.has(e.event_id)) open.push([e.event_id, tr]);
   }
+  // Re-fetch every open row so it stays open (and current) after a refresh.
+  const results = await Promise.all(
+    open.map(([id]) => call("GET", "/events/" + encodeURIComponent(id)))
+  );
+  open.forEach(([id, tr], i) => tr.after(attemptsRow(results[i])));
 }
 
 function renderAttempts(attempts) {

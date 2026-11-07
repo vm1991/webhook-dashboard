@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class EventCreate(BaseModel):
     event_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_-]+$")
     payload: dict[str, Any]
-    destination: Literal["always_succeed", "fail_twice", "always_fail", "slow"]
+    destination: Literal["always_succeed", "fail_twice", "always_fail", "always_timeout"]
 
 
 class EventOut(BaseModel):
@@ -32,6 +32,7 @@ class EventListItem(BaseModel):
 
     event_id: str
     destination: str
+    payload: dict[str, Any]
     status: Literal["PENDING", "SUCCEEDED", "FAILED"]
     attempt_count: int
     created_at: datetime

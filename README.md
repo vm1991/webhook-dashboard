@@ -1,270 +1,283 @@
 # Webhook Delivery Dashboard
 
-**Live app:** https://webhook-dashboard-2x9d.onrender.com
-The first visit after a quiet period can take 30–60 seconds to load (free hosting wakes up). After that it's fast.
+**Live app:** https://webhook-dashboard-2x9d.onrender.com · no login needed · API docs at `/docs`
+Free hosting: the first visit after ~15 minutes idle takes 30–60 seconds while the server wakes up. The deployment stays up; it does not expire.
+
+**Jump to:** [Try it](#try-it-in-2-minutes) · [Requirements](#requirements-checklist) · [Statuses](#how-statuses-work) · [Run locally](#run-the-app-and-tests-locally) · [Architecture](#architecture-and-data-model) · [Retries & guarantees](#retry-policy-and-delivery-guarantees) · [Limitations](#known-limitations-and-production-changes) · [AI usage](#ai-usage)
 
 ---
 
 ## What is this?
 
-When something happens in one system — say, an order is placed — it often needs to tell another system about it. That message is called an **event**, and sending it is a **delivery**.
+When something happens in one system (say, an order is placed), it often has to tell another system. That message is an **event**; sending it is a **delivery**.
 
-Deliveries don't always work the first time: the other side may be down, busy, or slow. This dashboard shows how a careful sender handles that:
+Deliveries don't always work the first time: the receiver may be down, refuse it, or be too slow. This app is a careful sender:
 
-- It **tries to deliver** each event and **records every try** (when, and whether it worked).
-- If a try fails, it **tries again later** — but **at most 5 times**, then it gives up.
-- If the other side takes too long (**more than 2 seconds**), it stops waiting and counts that as a failed try.
-- If the same event is sent twice by mistake, it is **not stored twice**.
-- Nothing is lost if you refresh the page or the server restarts.
+- it **records every delivery attempt** (time, outcome, error);
+- a failed attempt is **retried**, up to **5 attempts in total**, then it gives up;
+- a receiver that takes **more than 2 seconds** counts as a failed attempt (timeout);
+- submitting the **same event twice does not create a duplicate**;
+- everything is stored in a database, so it survives page refreshes and restarts.
 
-Think of a courier: they knock on the door; if nobody answers they come back later; after 5 visits they return the parcel. Every visit goes in the logbook.
+Four simulated receivers are built in, so every scenario can be tested in the browser:
 
----
-
-## Assumptions
-
-These are the choices behind how the demo behaves (decision numbers refer to [`SPEC.md`](SPEC.md)).
-
-**About events**
-- **You choose each event's name** (`event_id`). The same name always means the same event, so sending it twice doesn't create a second one. (D10, D11)
-- **An event can't be edited once created.** Sending the same name with different content is refused; use a new name instead. This guarantees a retry always sends exactly what the first try sent. (D2, D10)
-- **Each event goes to one destination,** chosen when you create it. (D6, D13)
-- **Creating an event doesn't send it.** Sending only happens when you click **Deliver** or **Process pending**, so every step is visible. (D5)
-
-**About delivery and retries**
-- **Every failure is treated as possibly temporary** and is tried again, up to **5 tries in total**. The demo doesn't distinguish "try later" errors from "never going to work" errors. (D14, D18)
-- **Taking longer than 2 seconds counts as a failure.** The sender stops waiting and records a timeout. (D22)
-- **Retries happen when you click,** not on a timer, and there's no waiting period between tries. In a real system a background job would retry on its own, waiting longer after each failure. (D20, D24)
-- **Only one Process pending round runs at a time,** even across browser tabs. (D21)
-
-**About the demo itself**
-- **The four destinations are pretend receivers** built into the same app, with fixed behaviour. A real system would send to each customer's own web address. (D22)
-- **There is no login.** Anyone with the link can create events or reset the demo, and everyone shares the same data. (D8, D27)
-- **Content must be JSON** (data in `{ "key": value }` form), and names may contain only letters, digits, `-` and `_`. (D16)
-
----
-
-## Words used on the page
-
-| Word | Meaning |
-|---|---|
-| **Event** | One message to deliver, with a name you choose (its `event_id`) and some content. |
-| **Destination** | Where the event goes. This demo has four pretend receivers with fixed behaviour (below). |
-| **Attempt** | One try at delivering. Each one is recorded. |
-| **Process pending** | "Try again now for everything not yet delivered" — one more try per waiting event. |
-| **Waiting** (`PENDING`) | Not delivered yet; will be tried again. |
-| **Delivered** (`SUCCEEDED`) | Done. It won't be sent again. |
-| **Gave up** (`FAILED`) | Failed 5 times. It won't be tried again. |
-
-### The four pretend destinations
-
-| Destination | What it does | Result |
+| Destination | Behaviour | End result |
 |---|---|---|
-| `always_succeed` | Accepts every delivery | Delivered on the 1st try |
-| `fail_twice` | Rejects the first two tries, accepts from the third | Delivered on the 3rd try |
-| `always_fail` | Rejects every delivery | Gives up after 5 tries |
-| `slow` | Takes 5 seconds to answer — longer than the 2-second limit | Every try times out; gives up after 5 |
+| `always_succeed` | Accepts every delivery | `SUCCEEDED` on attempt 1 |
+| `fail_twice` | Refuses attempts 1 and 2, accepts from attempt 3 | `SUCCEEDED` on attempt 3 |
+| `always_fail` | Refuses every delivery | `FAILED` after 5 attempts |
+| `always_timeout` | Answers after 5 s — longer than the 2 s limit | `FAILED` after 5 attempts, each `timeout after 2s` |
 
 ---
 
-## How an event's status changes
+## Try it in 2 minutes
+
+The page starts with four seed events, one per destination: `seed-always-succeed`, `seed-fail-twice`, `seed-always-fail`, `seed-always-timeout`.
+
+1. Click **Reset demo** for a clean start.
+2. Click **Process pending** (round 1). While it runs (~2 s, because `seed-always-timeout` waits for its timeout), click **Process pending** in a second browser tab → that tab gets `HTTP 409 process_already_running`. Only one round runs at a time.
+3. Click **Process pending** twice more (rounds 2–3). Click **History** on the `seed-fail-twice` row: `FAILURE`, `FAILURE`, `SUCCESS` — the event is `SUCCEEDED`. (`seed-always-succeed` was `SUCCEEDED` after round 1.)
+4. Click **Process pending** twice more (rounds 4–5). `seed-always-fail` and `seed-always-timeout` are now `FAILED`. **History** on `seed-always-timeout` shows `timeout after 2s` five times.
+5. **Duplicates:** in **Create event**, create an event (`HTTP 201`). Copy its `event_id` from the response into the `event_id` box (the box gets a fresh id after each create) and click **Create event** again → `HTTP 200`, `"duplicate": true`. Change the payload and submit the same id again → `HTTP 422 event_id_reused_with_different_payload`.
+6. **Deliver** `seed-always-succeed` → `HTTP 409 already_succeeded`; no new attempt.
+7. Refresh the page: everything is still there.
+
+---
+
+## Requirements checklist
+
+| # | Requirement (from the brief) | How it's met | See it |
+|---|---|---|---|
+| 1 | Create an event with a unique ID and JSON payload | Client chooses `event_id` (unique in the DB); payload must be a JSON object | **Create event** |
+| 2 | Three simulated destinations | `always_succeed`, `fail_twice`, `always_fail` — plus `always_timeout` to show timeouts | Destination drop-down |
+| 3 | Attempt delivery; view status and history (timestamps, outcomes, errors) | **Deliver** makes one attempt; every attempt is stored with time, outcome, error | **History** on any row |
+| 4 | Bounded retries; a button that processes pending deliveries | 5 attempts in total (`MAX_ATTEMPTS`); **Process pending** = one attempt for every `PENDING` event | Steps 2–4 above |
+| 5 | Duplicate submissions; defined behaviour for same ID + different payload | Same ID + same payload → `200`, existing event, `duplicate: true`. Same ID + different payload → `422`, original unchanged | Step 5 above |
+| 6 | Survive refreshes and restarts | PostgreSQL; an attempt is saved only after it finishes, so a restart mid-delivery leaves the event `PENDING` and it is retried | Step 7 above |
+| — | Simulated destinations inside the app | One route, `POST /sim/{name}`, in the same app | — |
+| — | FastAPI, REST, PostgreSQL, bounded retries, delivery timeouts | FastAPI + SQLAlchemy + Neon Postgres; 2 s timeout on every delivery | — |
+| — | Simple browser UI | One plain HTML page | Live app |
+| — | Tests: duplicates, retry limit, failed → successful | `pytest` suite (see [Tests](#run-the-app-and-tests-locally)) | — |
+| — | Seeded examples and reset | 4 seed events; **Reset demo** | Step 1 above |
+| — | HTTPS URL, free hosting, no credentials | Render + Neon free tiers; no login | — |
+
+---
+
+## How statuses work
+
+There are **two different results** — this is the easy one to misread:
+
+- each **attempt** has an **outcome**: `SUCCESS` or `FAILURE` (with the error), shown in **History**;
+- the **event** has one **status**: `PENDING`, `SUCCEEDED` or `FAILED`, shown in the events table.
+
+A failed attempt does **not** make the event `FAILED`. The event stays `PENDING` until an attempt succeeds or all 5 attempts are used.
 
 ```mermaid
 flowchart LR
-    A(["You create an event"]) --> B["Waiting"]
-    B --> C{"Try to deliver"}
-    C -->|worked| D(["Delivered ✓"])
-    C -->|failed| E{"5 tries used?"}
+    A(["Create event"]) --> B["PENDING"]
+    B --> C{"Attempt delivery"}
+    C -->|outcome SUCCESS| D(["SUCCEEDED"])
+    C -->|outcome FAILURE| E{"5 attempts used?"}
     E -->|no| B
-    E -->|yes| F(["Gave up ✗"])
+    E -->|yes| F(["FAILED"])
 ```
 
-A failed try sends the event back to **Waiting** until the next try (the next click of **Deliver** or **Process pending**). After the 5th failed try it stops for good.
+| Event status | Meaning | Attempted again? |
+|---|---|---|
+| `PENDING` | Not delivered yet (no attempt yet, or every attempt so far failed with attempts left) | Yes — next **Deliver** or **Process pending** |
+| `SUCCEEDED` | An attempt succeeded | No — done |
+| `FAILED` | All 5 attempts failed | No — final |
 
----
-
-## Example: the `fail_twice` destination
-
-`fail_twice` rejects the first two tries and accepts the third. Here's what you see when you click **Process pending** three times:
+### Example: `fail_twice`, clicking **Process pending** three times
 
 ```mermaid
 sequenceDiagram
     actor You
     participant D as Dashboard (sender)
     participant R as Receiver (fail_twice)
-    You->>D: Click "Process pending" (round 1)
-    D->>R: Try 1
-    R-->>D: Rejected
-    Note over D: Waiting, 1 try used
-    You->>D: Click "Process pending" (round 2)
-    D->>R: Try 2
-    R-->>D: Rejected
-    Note over D: Waiting, 2 tries used
-    You->>D: Click "Process pending" (round 3)
-    D->>R: Try 3
+    You->>D: Process pending (round 1)
+    D->>R: Attempt 1
+    R-->>D: Refused (HTTP 500)
+    Note over D: outcome FAILURE · event PENDING
+    You->>D: Process pending (round 2)
+    D->>R: Attempt 2
+    R-->>D: Refused (HTTP 500)
+    Note over D: outcome FAILURE · event PENDING
+    You->>D: Process pending (round 3)
+    D->>R: Attempt 3
     R-->>D: Accepted
-    Note over D: Delivered ✓ (3 tries)
+    Note over D: outcome SUCCESS · event SUCCEEDED
 ```
-
-| Click | Try | Receiver says | Status after |
-|---|---|---|---|
-| Process pending #1 | 1 | Rejected | Waiting |
-| Process pending #2 | 2 | Rejected | Waiting |
-| Process pending #3 | 3 | Accepted | **Delivered** |
-
-**Get history** for that event then shows all three tries with their times and results. Clicking **Deliver** on it afterwards is refused — it's already delivered.
 
 ---
 
-## User guide
+## Assumptions
 
-### The page, top to bottom
+Decision numbers (D…) refer to [`SPEC.md`](SPEC.md).
 
-| Section | What to do | What you'll see |
+- **The client chooses the `event_id`.** The same ID always means the same event. (D10, D11)
+- **Events can't be edited.** The same ID with a different payload is refused (`422`, following the IETF Idempotency-Key draft), so a retry always sends exactly what the first attempt sent. (D2, D10)
+- **One destination per event**, chosen at creation. (D6, D13)
+- **Creating an event doesn't send it.** Delivery happens only on **Deliver** or **Process pending**, so each step is visible. (D5)
+- **Every failure is treated as temporary** and retried up to 5 attempts in total; no "permanent error" fast-fail. (D14, D18)
+- **Retries run when you click**, with no wait between them (no backoff). A production system would use a background worker with increasing delays. (D20, D24)
+- **Only one Process pending round at a time**, across all tabs and users. (D21)
+- **No login.** Anyone with the link can create events or reset the demo; everyone shares the same data. (D8, D27)
+- `event_id` may contain only letters, digits, `-` and `_` (it is used in URLs). (D16)
+
+---
+
+## The page, section by section
+
+| Section | What it does |
+|---|---|
+| **Create event** | An `event_id` is pre-filled; edit the payload (JSON), pick a destination, click **Create event**. |
+| **Deliver** | Type an `event_id` → one delivery attempt now. |
+| **Event history** | Type an `event_id` → the event and all its attempts. |
+| **Process pending** | One attempt for every `PENDING` event; shows how many `succeeded`, `failed` (gave up) and are `still_pending`. |
+| **Reset demo** | Deletes everything and restores the 4 seed events. |
+| **Events table** | All events: status, number of attempts, payload. **History** opens a row's attempts right under it (click again to close). |
+
+Every action shows its **HTTP code** and response. `2xx` = it worked; `4xx` = refused, and `error` says why.
+
+<details>
+<summary><b>All responses, case by case</b> (click to expand)</summary>
+
+**Create event**
+
+| Case | HTTP | Response |
 |---|---|---|
-| **Create event** | An `event_id` is filled in for you. Edit the content if you like, pick a destination, click **Create event**. | `HTTP 201` = created. Sending the same id and content again gives `HTTP 200` with `"duplicate": true` (nothing new is stored). Same id with *different* content is refused (`HTTP 422`). |
-| **Deliver** | Type an `event_id`, click **Deliver**. | One try, right now, and its result. A delivered or given-up event is refused (`HTTP 409`). |
-| **Event history** | Type an `event_id`, click **Get history**. | The event and a table of every try: number, time, result, and the reason if it failed. |
-| **Process pending** | Click it. | One more try for **every** waiting event, and a count of how many were delivered, gave up, or are still waiting. |
-| **Reset demo** | Click it. | Everything is cleared and the 4 starting events come back. |
-| **Events** | — | All events with their status and number of tries. Updates after every action. |
+| New `event_id` | `201` | The event, `PENDING`, 0 attempts |
+| Same `event_id`, same payload and destination | `200` | Existing event with current status, `"duplicate": true`; nothing stored |
+| Same `event_id`, different payload or destination | `422` | `event_id_reused_with_different_payload`; original unchanged |
+| Different `event_id`, same payload | `201` | A separate event (the ID identifies the event, not its payload) |
+| Missing field, payload not a JSON object, unknown destination, empty or invalid `event_id` | `422` | `detail` lists what's wrong |
+| Payload box isn't valid JSON | — | Message on the page; nothing sent |
 
-### Try it in 2 minutes
+**Deliver**
 
-The page starts with four events, one per destination (`seed-always-succeed`, `seed-fail-twice`, `seed-always-fail`, `seed-slow`).
+| Case | HTTP | Response |
+|---|---|---|
+| `PENDING` event, attempt succeeds | `200` | outcome `SUCCESS`, event `SUCCEEDED` |
+| `PENDING` event, attempt fails, attempts left | `200` | outcome `FAILURE` + error, event stays `PENDING` |
+| `PENDING` event, 5th attempt fails | `200` | outcome `FAILURE` + error, event `FAILED` |
+| Event already `SUCCEEDED` / `FAILED` | `409` | `already_succeeded` / `already_failed`; no attempt |
+| Unknown `event_id` | `404` | `not_found` |
+| Same event delivered from two tabs at the same moment | `200` / `409` | One wins; the other gets `delivery_conflict` |
 
-1. Click **Process pending** 3 times. `seed-always-succeed` is **Delivered** after the 1st click, `seed-fail-twice` after the 3rd.
-2. Click **Process pending** 2 more times. `seed-always-fail` and `seed-slow` reach 5 tries and **Gave up**.
-3. **Get history** for `seed-slow`: every try says `timeout after 2s`.
-4. **Create event** with any id, then click **Create event** again without changing anything: it's recognised as a duplicate. Change the content and try again with the same id: refused.
-5. Open the page in a second tab. Click **Process pending** in both tabs quickly: the second one is told a round is already running (`HTTP 409`). Only one round runs at a time.
-6. Click **Reset demo** to start over.
+A failed attempt still returns `200`: the request worked, and the receiver's refusal is recorded as the outcome.
+
+**Errors you can see on a failed attempt:** `HTTP 500` (receiver refused), `timeout after 2s` (receiver too slow), `request error: …` (receiver unreachable).
+
+**Other actions**
+
+| Case | HTTP | Response |
+|---|---|---|
+| History, known / unknown `event_id` | `200` / `404` | Event + attempts / `not_found` |
+| Process pending | `200` | `{processed, succeeded, failed, still_pending}` (all `0` if nothing is pending) |
+| Process pending while another round runs | `409` | `process_already_running`; no attempts |
+| Reset demo | `200` | `{"reset": true, "seeded": 4}` |
+| Database unreachable (any action) | `503` | `database_unavailable` |
+
+</details>
 
 ---
 
 # For developers
 
-Full design, decisions (D1–D28) and the AI usage log: [`SPEC.md`](SPEC.md). Swagger UI: `/docs`.
+Full spec, all decisions (D1–D28) and the detailed AI log: [`SPEC.md`](SPEC.md).
 
-## Delivery flow
+## Run the app and tests locally
 
-```mermaid
-flowchart TD
-    A["Deliver one event<br/>POST /events/{id}/deliver"] --> C
-    B["Process pending<br/>POST /deliveries/process<br/>(lease lock, each PENDING event once)"] --> C
-    C["attempt_delivery()<br/>attempt_no = attempt_count + 1"] --> D["httpx POST {SIM_BASE_URL}/sim/{destination}<br/>Idempotency-Key, X-Attempt-No, timeout 2 s"]
-    D --> E["Receiver: POST /sim/{name}<br/>(plays the customer's endpoint)"]
-    E --> F{"Result"}
-    F -->|2xx| G[SUCCESS]
-    F -->|non-2xx / timeout / network error| H[FAILURE + error text]
-    G --> I["One DB transaction:<br/>insert attempt + update event"]
-    H --> I
-```
-
-`SUCCEEDED` and `FAILED` are terminal: `/deliver` on them returns `409` and makes no attempt.
-
-### Destinations (simulated receivers)
-One route in the same app, `POST /sim/{name}`. It stands in for the customer's webhook URL; `SIM_BASE_URL` is the only setting that points at it.
-
-| Destination | Behavior |
-|---|---|
-| `always_succeed` | 200 |
-| `fail_twice` | 500 on attempts 1–2 (reads `X-Attempt-No`), 200 after |
-| `always_fail` | 500 |
-| `slow` | waits 5 s → always exceeds the 2 s timeout |
-
----
-
-## API
-
-| Method & path | What it does | Main responses |
-|---|---|---|
-| `POST /events` | Create `{event_id, payload, destination}` | 201 new · 200 exact duplicate (`duplicate: true`, current status) · 422 same id + different payload/destination · 422 invalid input |
-| `POST /events/{id}/deliver` | One attempt now | 200 (attempt `SUCCESS` or `FAILURE` — a failed attempt is data, not an error) · 409 `already_succeeded` / `already_failed` / `delivery_conflict` · 404 |
-| `GET /events` | List, newest first | 200 |
-| `GET /events/{id}` | Event, payload and all attempts | 200 · 404 |
-| `POST /deliveries/process` | One retry round: one attempt for every `PENDING` event, oldest first | 200 `{processed, succeeded, failed, still_pending}` · 409 `process_already_running` |
-| `POST /admin/reset` | Clear all data, reseed 4 demo events | 200 `{reset: true, seeded: 4}` |
-| `POST /sim/{name}` | Simulated receiver | see above |
-| `GET /health` | DB check | 200 · 503 |
-
-Database unreachable → `503 database_unavailable` on any endpoint.
-
----
-
-## Data model (PostgreSQL)
-
-| Table | Columns | Key rules |
-|---|---|---|
-| `events` | id, **event_id** (client-supplied), payload (jsonb), destination, status, attempt_count, created_at, updated_at | `event_id` unique |
-| `delivery_attempts` | id, event_pk → events.id, attempt_no, attempted_at, outcome, error | **unique (event_pk, attempt_no)** |
-| `process_lock` | id (always 1), owner, locked_until | one row = the Process lease |
-
----
-
-## Retry policy and guarantees
-
-- **Bounded retries:** `MAX_ATTEMPTS` (env, default 5) counts **total** attempts (1 first try + 4 retries). The failed attempt that reaches the limit sets `FAILED` in the same transaction.
-- **Process pending** is the retry trigger (a stand-in for a scheduler): one attempt per `PENDING` event per round, each event in its own transaction so one failure doesn't undo the others.
-- **One round at a time:** a lease row (`process_lock`, 60 s, owner token, database clock). A second caller gets `409`. A crash mid-round can't block it forever — the lease expires.
-- **Timeouts:** every delivery is an HTTP call with a 2 s timeout (`DELIVERY_TIMEOUT_SECONDS`). Timeout, non-2xx and network errors are recorded as `FAILURE` with the reason and count toward the limit.
-- **Duplicates:** the DB unique constraint decides (`INSERT … ON CONFLICT DO NOTHING`, never check-then-insert). Payloads are compared as canonical JSON, so key order doesn't matter but `true` ≠ `1`. Same id + different payload → `422` (IETF Idempotency-Key draft).
-- **Concurrent deliveries of the same event:** the unique `(event_pk, attempt_no)` lets one win; the other gets `409` (or is skipped inside a Process round).
-- **Restart safety:** the attempt row and status update commit **after** the call returns. A crash mid-call saves nothing: the event stays `PENDING` and is retried next round. No `IN_PROGRESS` state can get stuck.
-- **Guarantee: at-least-once.** A receiver may get the same event twice (crash after the call, before the commit). Each request carries `Idempotency-Key: <event_id>` so the receiver can deduplicate.
-- **Persistence:** everything is in Postgres, so it survives refreshes and restarts.
-
----
-
-## Run locally (Windows, PowerShell)
+Windows / PowerShell (Python 3.13):
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env   # fill in DATABASE_URL and TEST_DATABASE_URL
-uvicorn app.main:app --reload
-```
-Open http://127.0.0.1:8000 (UI) or `/docs`.
-
-Environment variables (`.env.example`): `DATABASE_URL`, `TEST_DATABASE_URL`, `MAX_ATTEMPTS` (5); optional `SIM_BASE_URL` (default `http://127.0.0.1:$PORT`), `DELIVERY_TIMEOUT_SECONDS` (2), `SIM_SLOW_SECONDS` (5).
-
-## Tests
-
-```powershell
+copy .env.example .env   # set DATABASE_URL and TEST_DATABASE_URL (two Postgres databases)
+uvicorn app.main:app --reload     # http://127.0.0.1:8000  (UI)  ·  /docs
 pytest
 ```
-Runs against a separate database (`TEST_DATABASE_URL`); every test starts from empty tables. Covered: duplicates (identical, reordered keys, different payload, `true` vs `1`, different destination), validation, single delivery, retry limit via `/deliver` and via Process, fail → fail → success, terminal states (409), Process counts, lock held / expired, `MAX_ATTEMPTS` config, HTTP outcomes (500, timeout, headers), seed and reset, the UI page.
 
-## Deploy (Render, free tier)
-- Build: `pip install -r requirements.txt` · Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-- Env: `DATABASE_URL` (Neon), `PYTHON_VERSION=3.13.7`. Auto-deploys on push to `main`.
+Settings (`.env.example`): `DATABASE_URL`, `TEST_DATABASE_URL`, `MAX_ATTEMPTS` (5); optional `DELIVERY_TIMEOUT_SECONDS` (2), `SIM_SLOW_SECONDS` (5), `SIM_BASE_URL` (default `http://127.0.0.1:$PORT`).
 
----
+**Tests** run against a separate database; every test starts from empty tables. They cover: duplicates (identical, reordered keys, different payload, `true` vs `1`, different destination), input validation, single delivery, the retry limit via **Deliver** and via **Process pending**, fail → fail → success, `409` on finished events, Process counts, the lock (held / expired), `MAX_ATTEMPTS` config, HTTP outcomes (500, timeout, request headers), seed and reset, and the UI page.
 
-## Stack
-Python 3.13, FastAPI, SQLAlchemy 2.x, psycopg 3, PostgreSQL (Neon), httpx, pytest. Plain HTML + vanilla JS for the UI. Tables are created at startup (`create_all`).
+**Deploy (Render free tier):** build `pip install -r requirements.txt`; start `uvicorn app.main:app --host 0.0.0.0 --port $PORT`; env `DATABASE_URL` (Neon), `PYTHON_VERSION=3.13.7`. Auto-deploys from `main`.
 
----
+## Architecture and data model
 
-## Limitations / TODOs
+One FastAPI app, one PostgreSQL database (Neon), one static HTML page.
 
-- **No backoff.** Every Process round retries every `PENDING` event. Next: `next_attempt_at` with exponential backoff + jitter (D24).
-- **Lease isn't renewed.** The 60 s Process lease assumes a round finishes in time; ~30+ events that all time out (2 s each) could outlast it.
-- **No real end-to-end timeout test.** Tests run the app in-process, where httpx timeouts don't apply; the timeout path is tested with a faked `TimeoutException`, and checked by hand on the live app. Next: start uvicorn in a test thread with a short timeout.
-- **DB transaction stays open during the HTTP call** (up to the timeout), holding a pooled connection.
-- **Error responses (404/409/422) are not documented in `/docs`.**
-- **Reset is public, no authentication** — anyone with the URL can reset the demo.
-- **One destination per event;** no transient vs permanent failure split (all failures are retried).
-- **No migrations:** `create_all` creates tables but never alters them.
-- Only `MAX_ATTEMPTS` is validated at startup; a bad timeout value fails at first delivery.
+```mermaid
+flowchart TD
+    UI["Browser page (GET /)"] --> A["POST /events/{id}/deliver"]
+    UI --> B["POST /deliveries/process<br/>(lease lock; each PENDING event once,<br/>own transaction per event)"]
+    A --> C["attempt_delivery()<br/>attempt_no = attempt_count + 1"]
+    B --> C
+    C --> D["httpx POST {SIM_BASE_URL}/sim/{destination}<br/>headers: Idempotency-Key, X-Attempt-No · timeout 2 s"]
+    D --> E["POST /sim/{name}<br/>simulated receiver, same app"]
+    E --> F{"2xx?"}
+    F -->|yes| G["outcome SUCCESS"]
+    F -->|"no / timeout / network error"| H["outcome FAILURE + error"]
+    G --> I["One DB transaction:<br/>insert attempt + update event status"]
+    H --> I
+```
 
-## What I'd change for production
+| Table | Columns | Rules |
+|---|---|---|
+| `events` | id, **event_id**, payload (jsonb), destination, status, attempt_count, created_at, updated_at | `event_id` unique |
+| `delivery_attempts` | id, event_pk → events.id, attempt_no, attempted_at, outcome, error | unique (event_pk, attempt_no) |
+| `process_lock` | id (always 1), owner, locked_until | one row = the Process pending lease |
 
-- A **background worker** with backoff instead of a button; claim events with `FOR UPDATE SKIP LOCKED` (or a lease) and make the HTTP call **outside** the DB transaction, so several workers can split the work.
-- An **`endpoints` table** (customer URL, signing secret) and a `deliveries` table for many destinations per event; sign payloads (HMAC).
-- **Retryability per attempt:** treat 4xx (except 408/429) as permanent and fail fast.
-- An explicit **replay** endpoint for `FAILED` events (back to `PENDING`, history kept).
-- **Alembic** migrations, auth on admin endpoints, metrics/alerting on failure rates.
+**API:** `POST /events` · `GET /events` · `GET /events/{id}` · `POST /events/{id}/deliver` · `POST /deliveries/process` · `POST /admin/reset` · `POST /sim/{name}` · `GET /health`. Responses are listed in *All responses* above and in `/docs`.
 
----
+## Retry policy and delivery guarantees
+
+- **Bounded retries:** `MAX_ATTEMPTS` = total attempts (default 5: 1 first try + 4 retries). The failed attempt that reaches the limit sets `FAILED` in the same transaction. `FAILED` and `SUCCEEDED` are final (`409` on deliver).
+- **Process pending** is the retry trigger (stand-in for a scheduler): one attempt per `PENDING` event, oldest first, each in its own transaction so one failure doesn't undo the others.
+- **One round at a time:** a lease row (`process_lock`: 60 s, owner token, database clock). A second caller gets `409`; a crash mid-round can't block it forever because the lease expires.
+- **Timeouts:** every delivery is an HTTP call with a 2 s timeout. Timeouts, non-2xx answers and network errors are all recorded as `FAILURE` with the reason and count toward the limit.
+- **Duplicates:** decided by the database's unique constraint (`INSERT … ON CONFLICT DO NOTHING`), never check-then-insert, so simultaneous submits are safe. Payloads are compared as canonical JSON (key order ignored; `true` ≠ `1`).
+- **Concurrent deliveries of one event:** unique `(event_pk, attempt_no)` lets one win; the other gets `409` (or is skipped inside a round).
+- **If the app restarts during a delivery:** the attempt and status change are committed only **after** the HTTP call returns. A crash mid-call saves nothing — the event stays `PENDING` with no attempt row and is retried in the next round. There's no "in progress" state that could get stuck.
+- **Guarantee: at-least-once.** If the crash happens after the receiver accepted but before the commit, the receiver gets the event again on the retry. Every request carries `Idempotency-Key: <event_id>` so a real receiver can ignore the repeat. Sending twice is preferred over never sending.
+
+## Known limitations and production changes
+
+**Limitations / unfinished**
+- No backoff: every round retries every `PENDING` event immediately (D24).
+- The Process lease isn't renewed: ~30+ events that all time out (2 s each) could outlast its 60 s.
+- No end-to-end timeout test: tests run the app in-process, where httpx timeouts don't apply, so the timeout path uses a faked `TimeoutException`; the real timeout was checked on the live app.
+- The DB transaction stays open during the HTTP call (up to the timeout), holding a pooled connection.
+- Error responses aren't documented in `/docs`; reset is public; one destination per event; tables via `create_all` (no migrations); only `MAX_ATTEMPTS` is validated at startup.
+
+**For production I would**
+- Replace the button with a background worker using exponential backoff with jitter; claim events with `FOR UPDATE SKIP LOCKED` and make the HTTP call outside the DB transaction, so several workers can share the load.
+- Add an `endpoints` table (customer URL, signing secret, HMAC-signed payloads) and a `deliveries` table for several destinations per event.
+- Fail fast on permanent errors (4xx except 408/429) via a per-attempt `retryable` flag; add a replay endpoint for `FAILED` events.
+- Use Alembic migrations, authentication on admin endpoints, and metrics/alerts on failure rates.
+
+## AI usage
+
+**Tools:** Claude (chat) for design review; Claude Code (VS Code) for implementation.
+
+**How I worked.** I didn't build from the AI's first all-in-one spec. I split the work into five phases, and for each one: reviewed and corrected the spec before any code → approved Claude Code's file plan → read every diff, ran `pytest`, tested the live URL → next phase.
+
+**A suggestion I rejected.** The AI said **Process pending** needed no lock, only a disabled button. A disabled button protects one tab, not two browsers clicking at once. I required a server-side lock, and chose a lease row that expires so a crash can't block it (a plain flag would stay stuck). Tests T22/T23.
+
+**Other decisions I made**
+
+| The AI suggested | I did |
+|---|---|
+| `409` for same ID + different payload | `422`, per the IETF Idempotency-Key draft |
+| A `payload_hash` column | Dropped it; compare canonical JSON |
+| Map all database errors to `503` | Only connection errors |
+| Cut timeouts to save time | Kept them (they're in the brief); cut backoff |
+| A fixed limit of 5 attempts | Configurable `MAX_ATTEMPTS` |
+| `response_model` on every route | Skipped it; those routes return several shapes |
+
+**How I checked.** I confirmed files actually changed instead of trusting "done", and made reviews point to the actual code. I added `Literal` status types and an `event_id` format rule by hand. Testing the app as a user led me to rename `slow` → `always_timeout`, add per-row history and a payload column, and clarify statuses in this README.
+
+Claude's reviews of Claude Code's plans also caught a stale status check, the lock's transaction boundaries, the order of timeout error handling and id reuse on reset; I applied and verified each. Full dated log: [`SPEC.md`](SPEC.md).

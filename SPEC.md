@@ -11,7 +11,7 @@ Later phases are outlined only and are expanded when we reach them.
 | 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ✓ Done (live) |
 | 2 | Bounded retries + "process pending" | Reviewed | ✓ Done (live) |
 | 3 | HTTP destinations, timeouts, restart safety | Reviewed | ✓ Done (live) |
-| 4 | Browser UI, seed + reset, README | Reviewed | ☐ |
+| 4 | Browser UI, seed + reset, README | Reviewed | ✓ Done (live) |
 
 ## Requirements coverage
 | # | Requirement (from the brief) | Covered in |
@@ -111,7 +111,7 @@ Later phases are outlined only and are expanded when we reach them.
 | Simultaneous deliver on the same event (the loser) | **409** | `"error": "delivery_conflict"` (unique `event_pk, attempt_no` blocks it) |
 | Unknown event | **404** | `"error": "not_found"` |
 
-**`GET /events`** — **200**: list (event_id, destination, status, attempt_count, created_at), newest first.
+**`GET /events`** — **200**: list (event_id, destination, payload, status, attempt_count, created_at), newest first. (`payload` added in Phase 4, D30.)
 
 **`GET /events/{event_id}`** — **200**: event, payload and attempts ordered by attempt_no. Unknown → **404**.
 
@@ -211,10 +211,10 @@ The sim route plays the **receiver** (the customer's webhook URL); `/deliver` an
 | `always_succeed` | 200 |
 | `fail_twice` | 500 when `X-Attempt-No` ≤ 2, otherwise 200 (D25) |
 | `always_fail` | 500 |
-| `slow` (**new**) | Waits `SIM_SLOW_SECONDS` (default 5), then 200 — longer than the timeout, so it always times out |
+| `always_timeout` (**new**; first named `slow`, D29) | Waits `SIM_SLOW_SECONDS` (default 5), then 200 — longer than the timeout, so it always times out |
 
-- One handler, `async def`, waits with `asyncio.sleep` so a slow call doesn't block one of the worker threads that sync endpoints run on.
-- `slow` is added to the allowed destinations in `EventCreate`. No table change: `events.destination` stays text and now names the sim route to call.
+- One handler, `async def`, waits with `asyncio.sleep` so a slow receiver doesn't block one of the worker threads that sync endpoints run on.
+- `always_timeout` is added to the allowed destinations in `EventCreate`. No table change: `events.destination` stays text and now names the sim route to call.
 
 ### Delivery call (inside `attempt_delivery`, replaces the in-process function call)
 - `POST {SIM_BASE_URL}/sim/{destination}` with httpx: payload as JSON body; headers `Idempotency-Key: <event_id>` and `X-Attempt-No: <attempt_no>`; timeout `DELIVERY_TIMEOUT_SECONDS` (default 2).
@@ -243,12 +243,12 @@ The sim route plays the **receiver** (the customer's webhook URL); `/deliver` an
 | T25 | Delivery call raises `httpx.TimeoutException` (faked; no real 5 s wait) | FAILURE, error `timeout after 2s`, status `PENDING` |
 | T26 | Deliver any event | Request carries `Idempotency-Key` = event_id and `X-Attempt-No` = 1 |
 | T27 | `fail_twice` → deliver ×3 through `/sim` | FAILURE, FAILURE, SUCCESS |
-| T28 | Create an event with `destination: slow` | 201 (`slow` is accepted) |
-| T29 | `SIM_SLOW_SECONDS=0`, then `POST /sim/slow` directly | 200 (route exists and answers after its wait) |
+| T28 | Create an event with `destination: always_timeout` | 201 (accepted) |
+| T29 | `SIM_SLOW_SECONDS=0`, then `POST /sim/always_timeout` directly | 200 (route exists and answers after its wait) |
 
-No automated end-to-end timeout test: `TestClient` runs the app in-process, and httpx timeouts are enforced by its network transport, so a `slow` call in tests would wait and return 200. T25 (timeout → FAILURE), T28 and T29 cover the pieces; the live check covers them together.
+No automated end-to-end timeout test: `TestClient` runs the app in-process, and httpx timeouts are enforced by its network transport, so an `always_timeout` call in tests would wait and return 200. T25 (timeout → FAILURE), T28 and T29 cover the pieces; the live check covers them together.
 
-Manual check after deploy: create a `slow` event on the live URL, deliver it, see `timeout after 2s` in its history.
+Manual check after deploy: create an `always_timeout` event on the live URL, deliver it, see `timeout after 2s` in its history.
 
 ## Phase 4 — UI, seed + reset  ·  *Reviewed* (README is the final step, written separately)
 
@@ -263,12 +263,12 @@ Manual check after deploy: create a `slow` event on the live URL, deliver it, se
 | Event history | `event_id` input plus a **Get history** button → `GET /events/{event_id}`; shows the event and its attempts (attempt_no, time, outcome, error). |
 | Process pending | Button → `POST /deliveries/process`; shows the counts. Disabled while its request runs; the lock still covers other tabs. |
 | Reset demo | Button → `POST /admin/reset`. |
-| Events table | `GET /events`: event_id, destination, status, attempts, created. No row buttons. |
+| Events table | `GET /events`: event_id, destination, status, attempts, created, **payload** (wrapped JSON). Each row has a **History** button: shows that event's attempts (attempt_no, time, outcome, error) in a row directly under it, or "No attempts yet"; click again to close. Open rows stay open and are re-fetched after every refresh (D30). |
 
 The table refreshes after every action. Error responses (404/409/422) are shown as they come back, with their status code.
 
 ### Seed + reset
-- **Seed:** at startup, if `events` is empty, create one event per destination (`seed-always-succeed`, `seed-fail-twice`, `seed-always-fail`, `seed-slow`), all `PENDING`, each with payload `{"order_id": 1001, "quantity": 2}`. Uses `INSERT … ON CONFLICT DO NOTHING`, so a restart or a second instance can't duplicate them (D27).
+- **Seed:** at startup, if `events` is empty, create one event per destination (`seed-always-succeed`, `seed-fail-twice`, `seed-always-fail`, `seed-always-timeout`), all `PENDING`, each with payload `{"order_id": 1001, "quantity": 2}`. Uses `INSERT … ON CONFLICT DO NOTHING`, so a restart or a second instance can't duplicate them (D27).
 - **`POST /admin/reset`:** in one transaction, `TRUNCATE delivery_attempts, events, process_lock` (**without** `RESTART IDENTITY`), then seeds again. Returns 200 `{"reset": true, "seeded": 4}`. No auth (D8): anyone with the URL can reset the demo.
 - A reset during a Process round is safe: TRUNCATE waits for the delivery transaction in progress, and events that disappear mid-round are skipped (`session.get` returns `None`). Ids are not restarted, so an in-flight round holding old ids can never pick up the newly seeded events by reused ids.
 
@@ -279,11 +279,12 @@ The table refreshes after every action. Error responses (404/409/422) are shown 
 | T31 | Make some attempts, then reset | 200; exactly 4 seeded events, all `PENDING` with 0 attempts |
 | T32 | Run seed twice on an empty DB | Still 4 events |
 | T33 | Lock held, then reset, then process | Process returns 200 (reset cleared the lock) |
+| T34 | `GET /events` after creating an event | Each item includes the stored `payload` |
 
 The page's JavaScript has no automated test; it is checked by hand locally and on the live URL in an incognito window.
 
-### README (final step, after the UI is built)
-Claude drafts it from SPEC.md and the session's decisions; I review it before it is committed. It includes a flow diagram and a status diagram (`PENDING` → `SUCCEEDED` / `FAILED`) in Mermaid, which GitHub renders.
+### README
+Written last, reviewed by me as a first-time reader would. Structure: live link and cold start; a 2-minute walkthrough; a requirements checklist mapped to the brief; statuses explained once (attempt outcome vs event status) with Mermaid diagrams, including the `fail_twice` flow; assumptions; a page guide with every response in a collapsible table; then the brief's five sections (run and test locally, architecture and data model, retry policy and guarantees, limitations and production changes, AI usage).
 
 ---
 
@@ -315,49 +316,58 @@ Claude drafts it from SPEC.md and the session's decisions; I review it before it
 | D23 | Commit after the call; no `IN_PROGRESS` state; at-least-once delivery with `Idempotency-Key` | A crash can't leave a stuck event. Trade-off: the DB transaction (and a pooled connection) stays open during the call, up to the timeout. Production: claim with a lease + `FOR UPDATE SKIP LOCKED`, call outside the transaction, background worker instead of a button |
 | D24 | Backoff (`next_attempt_at`) not built | Needs a new column (`create_all` can't alter tables) and changes the Process round behavior; not in the brief. README: exponential backoff with jitter |
 | D25 | `fail_twice` decides from the `X-Attempt-No` header | The receiver can't see the sender's DB; a receiver-side counter table would add a table that reset must clear. Source of truth for attempts stays `delivery_attempts`; after a crash the retry is sent as the same attempt number again |
-| D26 | One static HTML page with vanilla JS calling the JSON API; Deliver and History take an `event_id` input | Simplest UI that covers every requirement; no build step; the API stays the single source of behavior |
+| D26 | One static HTML page with vanilla JS calling the JSON API; Deliver and Event history take an `event_id` input (plus per-row History, D30) | Simplest UI that covers every requirement; no build step; the API stays the single source of behavior |
 | D27 | Seed when empty at startup, and on reset; reset is public | A reviewer always lands on data, even after a Render restart. No auth is acceptable for a demo (D8) |
 | D28 | Reset does not use `RESTART IDENTITY` (the test fixture still does) | A Process round in flight holds a list of event ids; restarted ids would let it deliver the new seed events. Fresh ids make stale ids return `None`, so they are skipped |
+| D29 | Destination `slow` renamed to `always_timeout` | "slow" suggested it eventually succeeds; the name now says what the user sees and matches `always_succeed` / `always_fail`. `SIM_SLOW_SECONDS` kept |
+| D30 | Per-row History and a payload column in the events table; `GET /events` returns `payload` | Found by testing as a user: attempts and payload are expected next to the event, not only via a separate lookup |
 
 ## AI usage log
-Record of where I questioned, corrected or rejected AI output (feeds the README section).
+Full dated record behind the README's *AI usage* summary: where I set the direction, questioned, corrected or rejected AI output, and how I verified each result.
 
 **Tools:** Claude (chat, desktop app) for planning, spec discussion and reviewing Claude Code's plans; Claude Code (VS Code extension) for implementation.
+
+**How I worked:** I set the phases and the scope of each one, reviewed every spec section point by point before any code, and made the design calls; the AI drafted options and code.
 
 **How I checked output:** every Claude Code change started from a file plan I approved against `SPEC.md`; I read every diff, ran `pytest` locally and smoke-tested the live URL after each push; I verified API design choices against primary sources (IETF Idempotency-Key draft, Stripe docs) instead of taking the AI's answer; I confirmed files actually changed on disk rather than trusting "done".
 
 ### Decisions I drove
 | Date | AI suggested | What I did | Why | How I verified |
 |---|---|---|---|---|
-| Nov 5 | A full spec covering every requirement at once | rescoped into small phases (0–4), each working end to end | Smaller diffs I can actually review and explain | Phase 0 shipped live before any feature work |
-| Nov 5 | A stack-only first phase was not planned | Added Phase 0: framework + DB + test + live deploy before features | Remove deployment risk first | `/health` read from Neon on the live URL |
-| Nov 6 | A `payload_hash` column for duplicate detection | Questioned whether a hash was needed; dropped it and compare canonical JSON in the app (D4) | Duplicates are looked up by `event_id`, payloads are small; a hash added a column for no benefit | Tests T2–T4 (identical, reordered keys, different payload) |
-| Nov 6 | A `finished_at` column on attempts | Dropped for Phase 1 | Delivery is an in-process call; one timestamp covers "timestamps". Added back only when restart detection needs it | Spec review |
-| Nov 6 | Same ID + different payload → 409 | Changed to **422** with a distinct error code (D10) | Matches the IETF Idempotency-Key draft | Read the IETF draft and Stripe docs |
-| Nov 6 | Exact duplicate → 200 | I challenged it for `PENDING` events (proposed 409); asked for it to be checked against standards; kept 200 (D11) | The standard's 409 is for a retry while the original *request* is still in flight; `PENDING` is business state | IETF draft + Stripe docs |
+| Nov 5 | A full spec covering every requirement at once | I didn't build from it; I split the work into small phases (0–4), each working end to end | Smaller diffs I can actually review and explain | Phase 0 shipped live before any feature work |
+| Nov 5 | No deploy-first phase in the plan | I added Phase 0: framework + DB + test + live deploy before any feature | Remove deployment risk first | `/health` read from Neon on the live URL |
+| Nov 6 | A `payload_hash` column for duplicate detection | I questioned whether a hash was needed, dropped it, and compare canonical JSON in the app instead (D4) | Duplicates are looked up by `event_id`, payloads are small; a hash added a column for no benefit | Tests T2–T4 (identical, reordered keys, different payload) |
+| Nov 6 | A `finished_at` column on attempts | I dropped it | Delivery is an in-process call; one timestamp covers "timestamps". Added back only when restart detection needs it | Spec review |
+| Nov 6 | Same ID + different payload → 409 | I checked the IETF draft and Stripe docs and changed it to **422** with a distinct error code (D10) | Matches the IETF Idempotency-Key draft | Read the IETF draft and Stripe docs |
+| Nov 6 | Exact duplicate → 200 | I challenged it for `PENDING` events (proposed 409) and checked it against the standard before accepting; kept 200 (D11) | The standard's 409 is for a retry while the original *request* is still in flight; `PENDING` is business state | IETF draft + Stripe docs |
 | Nov 6 | Destination stored on the event | I questioned why it's stored when the endpoints are simulated; kept it after walking through retries (D13) | "Process pending" must know where to send; one event → many destinations would need a separate table (kept as a follow-up answer) | Spec review |
 | Nov 6 | (my idea) Overwrite payload while event is `PENDING` | Rejected after analysis (D10) | Attempts may already have sent the old payload; last-write-wins makes retries unsafe | Spec review |
 | Nov 6 | (my idea) Transient vs permanent failure classes | Deferred to "production changes" (D14) | `always_fail` must be retried to demonstrate the retry limit | Spec review |
-| Nov 6 | Claude Code offered to map all DB errors to 503 | Approved only a narrower handler: connection errors (`OperationalError`) → 503; confirmed constraint violations on deliver → 409 | 503 means "try later"; conflicts and bugs must not be masked as unavailability | Added a 503 test |
-| Nov 6 | Routes defined with full paths | Moved event routes under `APIRouter(prefix="/events")`, using `""` not `"/"` for collection routes | Cleaner routing; `"/"` would cause a 307 redirect from `/events` | `pytest` passes unchanged |
-| Nov 6 | AI reported spec updates as done | Noticed several times the file on disk had not changed; flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
+| Nov 6 | Claude Code offered to map all DB errors to 503 | I approved only a narrower handler: connection errors (`OperationalError`) → 503; constraint violations on deliver stay 409 | 503 means "try later"; conflicts and bugs must not be masked as unavailability | Added a 503 test |
+| Nov 6 | Routes defined with full paths | I had event routes moved under `APIRouter(prefix="/events")`, using `""` not `"/"` for collection routes | Cleaner routing; `"/"` would cause a 307 redirect from `/events` | `pytest` passes unchanged |
+| Nov 6 | AI reported spec updates as done | I noticed several times the file on disk had not changed and flagged it until fixed | Never trust "done" without checking the artifact | Checked the file content before each commit |
 | Nov 6 | `status`/`outcome` as plain `str` in output schemas | During my code walkthrough I asked why `status` had no `Literal`; added `Literal` types to three fields by hand (D17) | Server-owned values should still be constrained; catches typos, documents the enum | `pytest` passes |
-| Nov 6 | Hard-coded `MAX_ATTEMPTS = 5` | Made it an env var (D18) | Limit may change per environment without a code change | T21 |
-| Nov 6 | A `skipped` count in the process response | Questioned it; dropped it (D20) | Untestable in Phase 2, and always 0 with `SKIP LOCKED` workers (production design) | Spec review |
-| Nov 6 | (my idea) `FAILED_TRANSIENT` / `FAILED_PERMANENT` statuses | Deferred; retryability belongs to the attempt's error, not the event's status (D14) | A transient failure under the limit is just `PENDING`; no simulated destination returns a permanent error | Spec review |
-| Nov 6 | No lock on Process (unique constraint keeps data correct; disable the button in the UI) | Required a lock: two browsers can click at once, and a disabled button only protects one tab. Chose a lease row over a flag (crash recovery) and over an advisory lock (Neon pooler) (D21) | A double run gives events extra early attempts and inconsistent counts | T22, T23 |
-| Nov 6 | Claude proposed possibly cutting Phase 3 timeouts to save time | Checked the brief ("Resilience patterns, including bounded retries and delivery timeouts") and kept timeouts; cut backoff and the `IN_PROGRESS`/lease code instead (D23, D24) | Timeouts are an explicit requirement; backoff is not | Re-read the brief |
-| Nov 6 | (I noticed only `list_events` had a `response_model`) Claude suggested adding one to every route | Asked whether it was needed for routes with several outcomes; decided to skip it | Those routes return several status codes and bodies; a `response_model` would document only one success shape and isn't applied when a `JSONResponse` is returned | Code review |
+| Nov 6 | Hard-coded `MAX_ATTEMPTS = 5` | I made it an env var (D18) | Limit may change per environment without a code change | T21 |
+| Nov 6 | A `skipped` count in the process response | I questioned it and dropped it (D20) | Untestable in Phase 2, and always 0 with `SKIP LOCKED` workers (production design) | Spec review |
+| Nov 6 | (my idea) `FAILED_TRANSIENT` / `FAILED_PERMANENT` statuses | I deferred it after analysis: retryability belongs to the attempt's error, not the event's status (D14) | A transient failure under the limit is just `PENDING`; no simulated destination returns a permanent error | Spec review |
+| Nov 6 | No lock on Process (unique constraint keeps data correct; disable the button in the UI) | I rejected it and required a server-side lock: two browsers can click at once, and a disabled button only protects one tab. I chose a lease row over a flag (a crash would leave it stuck) and over an advisory lock (unreliable with Neon's pooled connections) (D21) | A double run gives events extra early attempts and inconsistent counts | T22, T23 |
+| Nov 6 | Possibly cutting Phase 3 timeouts to save time | I re-read the brief ("Resilience patterns, including bounded retries and delivery timeouts"), kept timeouts, and cut backoff and the `IN_PROGRESS`/lease code instead (D23, D24) | Timeouts are an explicit requirement; backoff is not | Re-read the brief |
+| Nov 6 | Adding `response_model` to every route (after I noticed only `list_events` had one) | I questioned whether it was needed for routes with several outcomes and decided to skip it | Those routes return several status codes and bodies; a `response_model` would document only one success shape and isn't applied when a `JSONResponse` is returned | Code review |
+| Nov 6 | Only a faked timeout test (T25) for the timeout destination | I asked for direct coverage: T28/T29 added. I evaluated a real end-to-end timeout test (uvicorn in a test thread) and deferred it on purpose; documented in the README | The timeout path should be covered by more than one fake | T28, T29; live check |
+| Nov 7 | — (my own test of the finished app as a first-time user) | I renamed `slow` → `always_timeout` (D29), added per-row History and a payload column (D30), and had the README explain that a failed attempt doesn't fail the event | Names and statuses were confusing for a new user | Manual test on the live app; T34 |
+| Nov 7 | First README draft: long, repetitive, technical | I reviewed it as the hiring manager would and had it restructured: walkthrough first, requirements checklist mapped to the brief, the brief's five sections, wording that matches the page ("event ID", "attempt", "payload") | The README is what reviewers read first | Re-read as a reviewer; walkthrough steps re-checked on the live app |
 
-### Issues caught when Claude reviewed Claude Code's plans (I approved and applied each fix)
+### Issues caught in plan review (Claude reviewing Claude Code's plans; I approved, applied and verified each fix)
 | Date | Claude Code's plan | Fix applied | Why | How I verified |
 |---|---|---|---|---|
 | Nov 5 | Used Neon's `postgresql://` URL as-is | Convert to `postgresql+psycopg://` | Plain scheme loads psycopg2 (not installed) → crash on startup | App starts locally and on Render |
 | Nov 5 | 503 test with tables created at startup | Simulate DB failure *after* startup (monkeypatch) | Otherwise the app can't start when the DB is down, so 503 is untestable | 503 test passes |
 | Nov 5 | No connection health check; unpinned deps; deprecated `on_event` | `pool_pre_ping=True`, pinned versions, lifespan handler | Neon suspends idle connections; reproducible builds | Live `/health` after idle period |
 | Nov 5 | `pytest` failed: `ModuleNotFoundError: app` | Added `pytest.ini` (`pythonpath = .`) | Repo root wasn't on the import path | `pytest` passes |
-| Nov 6 | `event_id` accepted any non-empty string | Claude flagged in the code walkthrough that an id with `/` can be created but never fetched; I added the pattern and test T7.2 by hand (D16) | Path parameters don't match `/` | T7.2 passes |
-| Nov 6 | No test for the `True == 1` case that motivated canonical JSON | Claude suggested it; I wrote T4.2 by hand | The test should prove the reason for the design | T4.2 passes |
+| Nov 6 | `event_id` accepted any non-empty string | Flagged during my code walkthrough: an id with `/` can be created but never fetched. I added the pattern and test T7.2 by hand (D16) | Path parameters don't match `/` | T7.2 passes |
+| Nov 6 | No test for the `True == 1` case that motivated canonical JSON | I wrote T4.2 by hand | The test should prove the reason for the design | T4.2 passes |
 | Nov 6 | Process loaded the PENDING ids, then attempted each event without checking its status again | Load each event in its own session and skip it unless still `PENDING` | A concurrent `/deliver` could finish the event in between, and Process would then attempt an already `SUCCEEDED` event | Read the full Phase 2 diff myself and confirmed the check; `pytest` passes |
 | Nov 6 | Lock acquire and release not specified as separate transactions | Acquire commits immediately in its own session; release uses a fresh session in `finally` | Otherwise a second caller blocks on the row lock instead of getting 409, and a failed round could fail to release | Read the diff myself; T22, T23 pass |
-| Nov 6 | Phase 3 plan didn't specify the order of the except blocks for the HTTP call | Catch `httpx.TimeoutException` before `httpx.RequestError` | `TimeoutException` is a subclass of `RequestError`; the wrong order records every timeout as `request error: ReadTimeout` | Read the diff myself; T25 passes; live `slow` event shows `timeout after 2s` |
+| Nov 6 | Phase 3 plan didn't specify the order of the except blocks for the HTTP call | Catch `httpx.TimeoutException` before `httpx.RequestError` | `TimeoutException` is a subclass of `RequestError`; the wrong order records every timeout as `request error: ReadTimeout` | Read the diff myself; T25 passes; live `slow` (now `always_timeout`) event shows `timeout after 2s` |
+| Nov 6 | Reset used `TRUNCATE … RESTART IDENTITY` | Reset without `RESTART IDENTITY` (D28) | An in-flight Process round holds old event ids; reused ids would let it deliver the new seed events | Read the diff; T31, T33 |
+| Nov 6 | Page plan didn't fix how responses are rendered or where the HTML is loaded from | `textContent` / `createElement` only, never `innerHTML`; path relative to the code file | Public demo with user-supplied payloads; the app may start from another folder | Read the diff (no `innerHTML`); live page works |

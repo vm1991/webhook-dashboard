@@ -263,6 +263,7 @@ Manual check after deploy: create an `always_timeout` event on the live URL, del
 | Event history | `event_id` input plus a **Get history** button → `GET /events/{event_id}`; shows the event and its attempts (attempt_no, time, outcome, error). |
 | Process pending | Button → `POST /deliveries/process`; shows the counts. Disabled while its request runs; the lock still covers other tabs. |
 | Reset demo | Button → `POST /admin/reset`. |
+| Event status legend | Static box at the top right: what `PENDING`, `SUCCEEDED` and `FAILED` mean, and that a failed attempt (outcome `FAILURE`) doesn't make the event `FAILED` (D31). |
 | Events table | `GET /events`: event_id, destination, status, attempts, created, **payload** (wrapped JSON). Each row has a **History** button: shows that event's attempts (attempt_no, time, outcome, error) in a row directly under it, or "No attempts yet"; click again to close. Open rows stay open and are re-fetched after every refresh (D30). |
 
 The table refreshes after every action. Error responses (404/409/422) are shown as they come back, with their status code.
@@ -321,6 +322,7 @@ Written last, reviewed by me as a first-time reader would. Structure: live link 
 | D28 | Reset does not use `RESTART IDENTITY` (the test fixture still does) | A Process round in flight holds a list of event ids; restarted ids would let it deliver the new seed events. Fresh ids make stale ids return `None`, so they are skipped |
 | D29 | Destination `slow` renamed to `always_timeout` | "slow" suggested it eventually succeeds; the name now says what the user sees and matches `always_succeed` / `always_fail`. `SIM_SLOW_SECONDS` kept |
 | D30 | Per-row History and a payload column in the events table; `GET /events` returns `payload` | Found by testing as a user: attempts and payload are expected next to the event, not only via a separate lookup |
+| D31 | Status legend on the page | Found by testing as a user: `PENDING` after a `FAILURE` attempt looked like a bug. Static text (shows the default of 5 attempts) |
 
 ## AI usage log
 Full dated record behind the README's *AI usage* summary: where I set the direction, questioned, corrected or rejected AI output, and how I verified each result.
@@ -354,7 +356,7 @@ Full dated record behind the README's *AI usage* summary: where I set the direct
 | Nov 6 | Possibly cutting Phase 3 timeouts to save time | I re-read the brief ("Resilience patterns, including bounded retries and delivery timeouts"), kept timeouts, and cut backoff and the `IN_PROGRESS`/lease code instead (D23, D24) | Timeouts are an explicit requirement; backoff is not | Re-read the brief |
 | Nov 6 | Adding `response_model` to every route (after I noticed only `list_events` had one) | I questioned whether it was needed for routes with several outcomes and decided to skip it | Those routes return several status codes and bodies; a `response_model` would document only one success shape and isn't applied when a `JSONResponse` is returned | Code review |
 | Nov 6 | Only a faked timeout test (T25) for the timeout destination | I asked for direct coverage: T28/T29 added. I evaluated a real end-to-end timeout test (uvicorn in a test thread) and deferred it on purpose; documented in the README | The timeout path should be covered by more than one fake | T28, T29; live check |
-| Nov 7 | — (my own test of the finished app as a first-time user) | I renamed `slow` → `always_timeout` (D29), added per-row History and a payload column (D30), and had the README explain that a failed attempt doesn't fail the event | Names and statuses were confusing for a new user | Manual test on the live app; T34 |
+| Nov 7 | — (my own test of the finished app as a first-time user) | I renamed `slow` → `always_timeout` (D29), added per-row History and a payload column (D30) and a status legend on the page (D31), and had the README explain that a failed attempt doesn't fail the event | Names and statuses were confusing for a new user | Manual test on the live app; T34 |
 | Nov 7 | First README draft: long, repetitive, technical | I reviewed it as the hiring manager would and had it restructured: walkthrough first, requirements checklist mapped to the brief, the brief's five sections, wording that matches the page ("event ID", "attempt", "payload") | The README is what reviewers read first | Re-read as a reviewer; walkthrough steps re-checked on the live app |
 
 ### Issues caught in plan review (Claude reviewing Claude Code's plans; I approved, applied and verified each fix)

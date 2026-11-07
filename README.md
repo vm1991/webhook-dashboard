@@ -137,6 +137,7 @@ Decision numbers (D…) refer to [`SPEC.md`](SPEC.md).
 | **Process pending** | One attempt for every `PENDING` event; shows how many `succeeded`, `failed` (gave up) and are `still_pending`. |
 | **Reset demo** | Deletes everything and restores the 4 seed events. |
 | **Events table** | All events: status, number of attempts, payload. **History** opens a row's attempts right under it (click again to close). |
+| **Event status** (top right) | A legend explaining `PENDING`, `SUCCEEDED` and `FAILED`, and that a failed attempt doesn't fail the event. |
 
 Every action shows its **HTTP code** and response. `2xx` = it worked; `4xx` = refused, and `error` says why.
 

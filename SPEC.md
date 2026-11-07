@@ -9,9 +9,9 @@ Later phases are outlined only and are expanded when we reach them.
 |---|---|---|---|
 | 0 | Stack wiring: FastAPI + Postgres + tests + live deploy | Reviewed | ✓ Done (live) |
 | 1 | Create event, duplicate handling, deliver once, view history | Reviewed | ✓ Done (live) |
-| 2 | Bounded retries + "process pending" | Reviewed | ✓ Done |
-| 3 | HTTP destinations, timeouts, restart safety | Reviewed | ☐ |
-| 4 | Browser UI, seed + reset, README | Draft — needs review | ☐ |
+| 2 | Bounded retries + "process pending" | Reviewed | ✓ Done (live) |
+| 3 | HTTP destinations, timeouts, restart safety | Reviewed | ✓ Done (live) |
+| 4 | Browser UI, seed + reset, README | Reviewed | ☐ |
 
 ## Requirements coverage
 | # | Requirement (from the brief) | Covered in |
@@ -250,10 +250,40 @@ No automated end-to-end timeout test: `TestClient` runs the app in-process, and 
 
 Manual check after deploy: create a `slow` event on the live URL, deliver it, see `timeout after 2s` in its history.
 
-## Phase 4 — Ship (outline)  ·  *Draft — needs review*
-- Single static HTML page: create form, events table, attempt history, "Process pending" and "Reset demo" buttons.
-- Seed one event per destination on empty DB; `POST /admin/reset` wipes and reseeds.
-- README: run locally, architecture, retry policy and guarantees, limitations, AI usage.
+## Phase 4 — UI, seed + reset  ·  *Reviewed* (README is the final step, written separately)
+
+### Browser UI: `GET /`
+- One static file, `app/static/index.html`: plain HTML plus a little vanilla JS calling the existing JSON API. No framework, no styling. First pass, kept simple (D26).
+- `GET /` serves this page instead of "Hello World", so `test_root` gets updated.
+
+| Section | What it does |
+|---|---|
+| Create event | Fields: `event_id` (prefilled with a fresh `evt-<random>`), payload as a JSON text area (default `{"order_id": 1001, "quantity": 2}`), destination drop-down with all 4. Submit → `POST /events`; shows the status code and the response. |
+| Deliver | `event_id` input plus a **Deliver** button → `POST /events/{event_id}/deliver`; shows the status code and the response. |
+| Event history | `event_id` input plus a **Get history** button → `GET /events/{event_id}`; shows the event and its attempts (attempt_no, time, outcome, error). |
+| Process pending | Button → `POST /deliveries/process`; shows the counts. Disabled while its request runs; the lock still covers other tabs. |
+| Reset demo | Button → `POST /admin/reset`. |
+| Events table | `GET /events`: event_id, destination, status, attempts, created. No row buttons. |
+
+The table refreshes after every action. Error responses (404/409/422) are shown as they come back, with their status code.
+
+### Seed + reset
+- **Seed:** at startup, if `events` is empty, create one event per destination (`seed-always-succeed`, `seed-fail-twice`, `seed-always-fail`, `seed-slow`), all `PENDING`, each with payload `{"order_id": 1001, "quantity": 2}`. Uses `INSERT … ON CONFLICT DO NOTHING`, so a restart or a second instance can't duplicate them (D27).
+- **`POST /admin/reset`:** in one transaction, `TRUNCATE delivery_attempts, events, process_lock` (**without** `RESTART IDENTITY`), then seeds again. Returns 200 `{"reset": true, "seeded": 4}`. No auth (D8): anyone with the URL can reset the demo.
+- A reset during a Process round is safe: TRUNCATE waits for the delivery transaction in progress, and events that disappear mid-round are skipped (`session.get` returns `None`). Ids are not restarted, so an in-flight round holding old ids can never pick up the newly seeded events by reused ids.
+
+### Acceptance criteria (automated tests)
+| # | Test | Expected |
+|---|---|---|
+| T30 | `GET /` | 200, HTML, contains the "Process pending" button |
+| T31 | Make some attempts, then reset | 200; exactly 4 seeded events, all `PENDING` with 0 attempts |
+| T32 | Run seed twice on an empty DB | Still 4 events |
+| T33 | Lock held, then reset, then process | Process returns 200 (reset cleared the lock) |
+
+The page's JavaScript has no automated test; it is checked by hand locally and on the live URL in an incognito window.
+
+### README (final step, after the UI is built)
+Claude drafts it from SPEC.md and the session's decisions; I review it before it is committed. It includes a flow diagram and a status diagram (`PENDING` → `SUCCEEDED` / `FAILED`) in Mermaid, which GitHub renders.
 
 ---
 
@@ -285,6 +315,9 @@ Manual check after deploy: create a `slow` event on the live URL, deliver it, se
 | D23 | Commit after the call; no `IN_PROGRESS` state; at-least-once delivery with `Idempotency-Key` | A crash can't leave a stuck event. Trade-off: the DB transaction (and a pooled connection) stays open during the call, up to the timeout. Production: claim with a lease + `FOR UPDATE SKIP LOCKED`, call outside the transaction, background worker instead of a button |
 | D24 | Backoff (`next_attempt_at`) not built | Needs a new column (`create_all` can't alter tables) and changes the Process round behavior; not in the brief. README: exponential backoff with jitter |
 | D25 | `fail_twice` decides from the `X-Attempt-No` header | The receiver can't see the sender's DB; a receiver-side counter table would add a table that reset must clear. Source of truth for attempts stays `delivery_attempts`; after a crash the retry is sent as the same attempt number again |
+| D26 | One static HTML page with vanilla JS calling the JSON API; Deliver and History take an `event_id` input | Simplest UI that covers every requirement; no build step; the API stays the single source of behavior |
+| D27 | Seed when empty at startup, and on reset; reset is public | A reviewer always lands on data, even after a Render restart. No auth is acceptable for a demo (D8) |
+| D28 | Reset does not use `RESTART IDENTITY` (the test fixture still does) | A Process round in flight holds a list of event ids; restarted ids would let it deliver the new seed events. Fresh ids make stale ids return `None`, so they are skipped |
 
 ## AI usage log
 Record of where I questioned, corrected or rejected AI output (feeds the README section).
@@ -327,3 +360,4 @@ Record of where I questioned, corrected or rejected AI output (feeds the README 
 | Nov 6 | No test for the `True == 1` case that motivated canonical JSON | Claude suggested it; I wrote T4.2 by hand | The test should prove the reason for the design | T4.2 passes |
 | Nov 6 | Process loaded the PENDING ids, then attempted each event without checking its status again | Load each event in its own session and skip it unless still `PENDING` | A concurrent `/deliver` could finish the event in between, and Process would then attempt an already `SUCCEEDED` event | Read the full Phase 2 diff myself and confirmed the check; `pytest` passes |
 | Nov 6 | Lock acquire and release not specified as separate transactions | Acquire commits immediately in its own session; release uses a fresh session in `finally` | Otherwise a second caller blocks on the row lock instead of getting 409, and a failed round could fail to release | Read the diff myself; T22, T23 pass |
+| Nov 6 | Phase 3 plan didn't specify the order of the except blocks for the HTTP call | Catch `httpx.TimeoutException` before `httpx.RequestError` | `TimeoutException` is a subclass of `RequestError`; the wrong order records every timeout as `request error: ReadTimeout` | Read the diff myself; T25 passes; live `slow` event shows `timeout after 2s` |

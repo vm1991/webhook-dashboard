@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webhook Delivery Dashboard</title>
+</head>
+<body>
+<h1>Webhook Delivery Dashboard</h1>
+
+<h2>Create event</h2>
+<form id="create-form">
+  <p><label>event_id <input id="create-id" size="30"></label></p>
+  <p><label>payload (JSON)<br><textarea id="create-payload" rows="4" cols="40">{"order_id": 1001, "quantity": 2}</textarea></label></p>
+  <p><label>destination
+    <select id="create-dest">
+      <option>always_succeed</option>
+      <option>fail_twice</option>
+      <option>always_fail</option>
+      <option>slow</option>
+    </select></label></p>
+  <button type="submit">Create event</button>
+</form>
+<pre id="create-out"></pre>
+
+<h2>Deliver</h2>
+<p><label>event_id <input id="deliver-id" size="30"></label>
+<button id="deliver-btn" type="button">Deliver</button></p>
+<pre id="deliver-out"></pre>
+
+<h2>Event history</h2>
+<p><label>event_id <input id="history-id" size="30"></label>
+<button id="history-btn" type="button">Get history</button></p>
+<pre id="history-out"></pre>
+<table id="attempts" border="1" hidden>
+  <thead><tr><th>attempt_no</th><th>time</th><th>outcome</th><th>error</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Process pending</h2>
+<p><button id="process-btn" type="button">Process pending</button></p>
+<pre id="process-out"></pre>
+
+<h2>Reset demo</h2>
+<p><button id="reset-btn" type="button">Reset demo</button></p>
+<pre id="reset-out"></pre>
+
+<h2>Events</h2>
+<table id="events" border="1">
+  <thead><tr><th>event_id</th><th>destination</th><th>status</th><th>attempts</th><th>created</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<script>
+function freshId() {
+  return "evt-" + Math.random().toString(36).slice(2, 10);
+}
+
+function show(preId, status, body) {
+  document.getElementById(preId).textContent =
+    "HTTP " + status + "\n" + JSON.stringify(body, null, 2);
+}
+
+// Calls the API; returns {status, body}. Non-JSON or network errors are shown, not thrown.
+async function call(method, url, jsonBody) {
+  const opts = { method: method };
+  if (jsonBody !== undefined) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(jsonBody);
+  }
+  try {
+    const res = await fetch(url, opts);
+    let body;
+    try { body = await res.json(); } catch (e) { body = { error: "non_json_response" }; }
+    return { status: res.status, body: body };
+  } catch (e) {
+    return { status: 0, body: { error: "network_error", message: String(e) } };
+  }
+}
+
+function cell(row, text) {
+  const td = document.createElement("td");
+  td.textContent = text === null || text === undefined ? "" : String(text);
+  row.appendChild(td);
+}
+
+async function refreshEvents() {
+  const r = await call("GET", "/events");
+  const tbody = document.querySelector("#events tbody");
+  tbody.replaceChildren();
+  if (r.status !== 200 || !Array.isArray(r.body)) return;
+  for (const e of r.body) {
+    const tr = document.createElement("tr");
+    cell(tr, e.event_id);
+    cell(tr, e.destination);
+    cell(tr, e.status);
+    cell(tr, e.attempt_count);
+    cell(tr, e.created_at);
+    tbody.appendChild(tr);
+  }
+}
+
+function renderAttempts(attempts) {
+  const table = document.getElementById("attempts");
+  const tbody = table.querySelector("tbody");
+  tbody.replaceChildren();
+  table.hidden = !attempts;
+  for (const a of attempts || []) {
+    const tr = document.createElement("tr");
+    cell(tr, a.attempt_no);
+    cell(tr, a.attempted_at);
+    cell(tr, a.outcome);
+    cell(tr, a.error);
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById("create-id").value = freshId();
+
+document.getElementById("create-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  let payload;
+  try {
+    payload = JSON.parse(document.getElementById("create-payload").value);
+  } catch (e) {
+    document.getElementById("create-out").textContent = "Payload is not valid JSON: " + e.message;
+    return;
+  }
+  const r = await call("POST", "/events", {
+    event_id: document.getElementById("create-id").value,
+    payload: payload,
+    destination: document.getElementById("create-dest").value,
+  });
+  show("create-out", r.status, r.body);
+  if (r.status === 201) document.getElementById("create-id").value = freshId();
+  refreshEvents();
+});
+
+document.getElementById("deliver-btn").addEventListener("click", async () => {
+  const id = document.getElementById("deliver-id").value;
+  const r = await call("POST", "/events/" + encodeURIComponent(id) + "/deliver");
+  show("deliver-out", r.status, r.body);
+  refreshEvents();
+});
+
+document.getElementById("history-btn").addEventListener("click", async () => {
+  const id = document.getElementById("history-id").value;
+  const r = await call("GET", "/events/" + encodeURIComponent(id));
+  show("history-out", r.status, r.body);
+  renderAttempts(r.status === 200 ? r.body.attempts : null);
+  refreshEvents();
+});
+
+document.getElementById("process-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("process-btn");
+  btn.disabled = true;
+  try {
+    const r = await call("POST", "/deliveries/process");
+    show("process-out", r.status, r.body);
+  } finally {
+    btn.disabled = false;
+  }
+  refreshEvents();
+});
+
+document.getElementById("reset-btn").addEventListener("click", async () => {
+  const r = await call("POST", "/admin/reset");
+  show("reset-out", r.status, r.body);
+  refreshEvents();
+});
+
+refreshEvents();
+</script>
+</body>
+</html>

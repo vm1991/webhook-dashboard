@@ -6,7 +6,8 @@ from app import db
 def test_root(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert r.json() == {"message": "Hello World"}
+    assert "text/html" in r.headers["content-type"]
+    assert "Process pending" in r.text
 
 
 def test_health_ok(client):

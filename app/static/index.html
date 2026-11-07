@@ -8,6 +8,19 @@
 <body>
 <h1>Webhook Delivery Dashboard</h1>
 
+<aside style="float: right; max-width: 24em; margin: 0 0 1em 1em;">
+  <h2>Event status</h2>
+  <table border="1">
+    <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>PENDING</td><td>Not delivered yet. Either no attempt has been made, or attempts failed but some are left. It will be tried again on Deliver or Process pending.</td></tr>
+      <tr><td>SUCCEEDED</td><td>An attempt succeeded. Done, not sent again.</td></tr>
+      <tr><td>FAILED</td><td>All 5 attempts failed. Final, not tried again.</td></tr>
+    </tbody>
+  </table>
+  <p>A failed attempt (outcome FAILURE) does not make the event FAILED; it stays PENDING until an attempt succeeds or all 5 are used.</p>
+</aside>
+
 <h2>Create event</h2>
 <form id="create-form">
   <p><label>event_id <input id="create-id" size="30"></label></p>
